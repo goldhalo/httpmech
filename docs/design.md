@@ -1,252 +1,228 @@
 # httpmech 概要设计（v0.1 草案）
 
 > 状态：**接口草案，未实现**。本文件与 `include/httpmech/*.hpp` 一起评审；
-> 评审通过后再写 `src/`。
+> 评审通过后写 `src/`。
 
 ---
 
-## 1. 定位
+## 1. 定位与范围
 
-**HTTP/1.1 的协议胶水层。** 站在 netmech 的 TCP 之上，负责把字节流切成
-一条条 HTTP 消息、把响应写回去；不做业务、不做框架。
-
-与家族里其它库的分工：
+**HTTP/1.1 与 WebSocket 的服务端协议层**，站在 netmech 的 TCP 之上。
+部署形态固定为 **nginx 在前**：TLS、HTTP/2、限流、静态文件都由 nginx 负责，
+本库只处理 nginx 转过来的明文 HTTP/1.1 与 WebSocket。
 
 ```
-            ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐
-  应用层     │ modbusmech  │  │  rtspmech   │  │   rtpmech   │  │  httpmech   │
-            └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘
-                   │                │                │                │
-            ┌──────┴────────────────┴────────────────┴────────────────┴──────┐
-  传输层     │                    netmech（TCP / UDP / 定时器）              │
-            └───────────────────────────────────────────────────────────────┘
+浏览器 ──HTTPS/WSS──► nginx ──HTTP/1.1 明文──► httpmech ──► netmech ──► TCP
+                       (TLS 终结)                (本库)
 ```
 
-只依赖 netmech，不依赖 rtspmech / rtpmech（三者是平级的协议层）。
-
-### 做
+### v0.1 做
 
 | 项 | 说明 |
 |---|---|
-| 请求 / 响应解析 | HTTP/1.0、HTTP/1.1；增量、可喂 1 字节 |
-| chunked | 请求体解码、响应体编码 |
+| HTTP/1.1 解析与序列化 | 增量、可喂 1 字节；chunked 请求体解码 |
+| 路由 | (方法, 路径) 精确匹配 + before/after 钩子 |
+| WebSocket | Upgrade 握手 + RFC 6455 帧层 + 分片/控制帧/关闭握手 |
 | keep-alive | 连接复用、空闲超时、单连接请求数上限 |
 | 流式 body | 上传/回灌大报文不占内存 |
-| 服务端 | 监听、每连接会话、回调式处理 |
-| 客户端 | 单连接串行队列、keep-alive 复用 |
-| 资源上限 | 头大小/条数、body 大小、chunk 行长度 |
+| 反向代理识别 | `X-Real-IP` / `X-Real-PORT` / `X-AGENT-SSL`，且只采信白名单来源 |
+| 资源上限 | 头大小/条数、body 大小、帧大小、单消息大小 |
 
-### 不做（v0.1）
+### v0.1 不做
 
-| 项 | 为什么 | 以后 |
-|---|---|---|
-| 路由 / 中间件 | 十几个接口用 if-else 更直白；加框架要带一整套配置与生命周期约定 | 不做 |
-| TLS / HTTPS | 要引 OpenSSL，编译与部署成本翻倍；板端 HTTP 一般在内网 | v0.3 评估 |
-| HTTP/2 | 多路复用 + HPACK，工作量比 HTTP/1.1 大数倍 | 不做 |
-| WebSocket 升级 | `Upgrade` 头保留可识别，但不实现握手后的帧协议 | 按需 |
-| gzip 解码 | 需要 zlib；客户端不主动发 `Accept-Encoding` 即可绕开 | 按需 |
-| multipart 编解码 | 属应用语义；文件上传用流式 body 自己切 | 不做 |
-| 静态文件服务 | 属应用；`sendfile` 与 netmech 的 `write(ConstBuf)` 模型也不匹配 | 不做 |
-| 自动重定向 / cookie 罐 | 客户端保持"一层薄封装"，策略交应用 | 不做 |
+| 项 | 为什么 |
+|---|---|
+| **TLS / HTTPS** | nginx 终结；引 OpenSSL 会打破"零外部依赖"的家族约定 |
+| **HTTP/2 / h2c** | nginx 可以把 H2 转成 H1 再转过来；自己实现 HPACK + 多路复用代价太大 |
+| **gRPC** | 不做 |
+| **业务纤程 / 线程池** | 参考实现用 boost fiber 跑业务；本库只给回调，耗时活儿由接入方自己丢线程池 |
+| **HTTP / WebSocket 客户端** | 第一阶段不需要；接口形状先放着（`client.hpp`，标 v0.2） |
+| 路径参数 `:id`、通配符、正则路由 | 十几条接口用精确匹配就够，参数解析是复杂度源头 |
+| 静态文件服务 | nginx 的 `root` / `try_files` 比我们做得好 |
+| gzip、multipart、cookie 罐 | 属应用语义或由 nginx 处理 |
 
 ---
 
-## 2. 模块划分
+## 2. 与现有实现（`wtoe::HttpProtocol`）的对照
+
+参考实现约 13.8k 行，用 Boost.Beast + Boost.Asio + boost fiber，覆盖 H1/H2/gRPC/
+WebSocket/SSL 双端。本节列出"留什么、砍什么"，作为本次设计的依据。
+
+| 参考实现的组成 | httpmech v0.1 | 理由 |
+|---|---|---|
+| Boost.Beast 的 H1 解析/序列化 | 自研 `Parser`（picohttpparser 打底） | 家族约定：不引 Boost |
+| Boost.Beast 的 WebSocket | 自研帧层（约 300 行） | 同上；帧层本身不复杂 |
+| 多 `io_context` + `TaskFiberPool`（纤程业务线程） | 只用 netmech 的 io 线程，回调派发 | **明确不要纤程**；业务耗时活儿交给调用方的线程池 |
+| SSL context / ALPN / `SslWebsocketSession` | 不做 | nginx 终结 TLS |
+| HTTP/2（`Http2Session`、`H2Transport`、h2c 嗅探） | 不做 | nginx 可代劳 |
+| gRPC（`GrpcFacade` / `GrpcFramer`） | 不做 | 无需求 |
+| `IHttpServer::Attr` 建造者 + `setRoute` / `setWebsocketRoute` | `Router` 的 `route()` / `websocket()` | **保留这个形态**，接入方的用法不变 |
+| `beforeCb` / `afterCb`（`std::list`） | `before()` / `after()` 钩子 | 语义一致：鉴权 + 操作日志 |
+| `SHttpRequest` 值语义（`std::string` 全拷） | 视图（`string_view`） | 零拷贝；代价是"要留自己拷" |
+| `X-Real-IP` / `X-Real-PORT` / `X-AGENT-SSL` | `real_ip()` / `real_port()` / `is_forwarded_https()` | **加了一层白名单**：只采信 `trusted_proxies` 里的来源，否则这些头是客户端随便写的 |
+| 超时：连接 3s / 读 10s / 写 10s / keep-alive 60s | 见 §5 默认值表 | 沿用同一组经验值 |
+| `IHttpClient` / `IWebsocketClient` | v0.2 预留 | 第一阶段不做 |
+
+**一句话**：把参考实现里"协议 + 路由 + WebSocket"这三块留下，把"传输安全 +
+H2 + gRPC + 纤程调度"四块交给 nginx 和调用方。
+
+---
+
+## 3. 模块划分
 
 | 文件 | 职责 | 依赖 |
 |---|---|---|
 | `common.hpp` | Method / Version / Status / Limits / Errc | 标准库 |
-| `span.hpp` | 只读 span（C++17 补丁，与 rtspmech 同一份） | 标准库 |
-| `headers.hpp` | `HeadersView`（借用）+ `Headers`（拥有） | 标准库 |
-| `message.hpp` | `HttpRequest` / `HttpResponse` 视图 | 上两个 |
-| `parser.hpp` | `Parser`：增量解析，服务端/客户端共用 | + picohttpparser |
-| `server.hpp` | `HttpServer` / `RequestHandler` / `ResponseWriter` | + netmech |
-| `client.hpp` | `HttpClient` / `RequestSpec` / `ResponseHandler` | + netmech |
-| `httpmech.hpp` | 汇总 | — |
-
-`parser.hpp` 之前的部分都不碰 netmech —— 只写单元测试或做报文工具时，
-只包含前四个头就够，不需要链传输层。
-
----
-
-## 3. 一次请求的数据流（服务端）
-
-```
-netmech::Conn.on_read(ec, buf, n)
-        │
-        ▼
-    Parser::feed(span{buf.data, n})
-        │  攒够一条头 ──► Result::headers ──► on_headers()  [stream 模式]
-        │  攒够整条   ──► Result::message ──► on_request()  [aggregate 模式]
-        │  一块 body  ──► Result::body_chunk ──► on_body_data()
-        │  收完       ──► Result::message_end ──► on_body_end()
-        ▼
-    ResponseWriter（应用填状态/头/body）
-        │  end()
-        ▼
-    序列化成字节 → netmech::Conn::write(ConstBuf)
-        │
-        ▼
-    决定复用还是关闭：keep_alive && 未达 max_requests_per_connection
-```
-
-要点：**读 → 解析 → 回调 → 写**全在同一条 io 线程上，没有跨线程投递，
-也没有锁。
+| `span.hpp` | 只读 span（C++17 补丁） | 标准库 |
+| `headers.hpp` | `HeadersView`（借用）/ `Headers`（拥有） | 标准库 |
+| `message.hpp` | `HttpRequest` / `HttpResponse` 视图 + 代理头解析 | 上两个 |
+| `parser.hpp` | `Parser`：增量 HTTP 解析 | + picohttpparser |
+| `websocket.hpp` | `WebSocketSession` / `WebSocketConfig` / 握手工具 | 标准库（SHA-1/Base64 在 src/） |
+| `server.hpp` | `HttpServer` / `ResponseWriter` / `RequestHandler` | + netmech |
+| `router.hpp` | `Router`：精确路由 + before/after | 上两个 |
+| `client.hpp` | **v0.2 预留**，不实现 | — |
 
 ---
 
 ## 4. 关键设计决策
 
 ### D1 解析器自带拼包缓冲
+一条头必然跨 `read`。若视图指向两块内存，消息层就得拼接 —— 复杂度推给每个使用者。
+改为解析器持有一块可增长缓冲，视图永远连续。代价是一次内存搬移，收益是所有调用点都简单。
 
-**问题**：一条头部可能跨两次 `read`（这次读到 `"Content-Ty"`，下次才是
-`"pe: ...\r\n\r\n"`）。若视图直接指向两次不同的接收缓冲，消息层就得拼接 ——
-等于把复杂度推给每个使用者。
-
-**选择**：`Parser` 内部持有一块可增长的缓冲，视图永远指向它。
-
-**代价**：缓冲满时要搬一次内存。**收益**：所有使用者的代码都简单，
-`string_view` 天然连续。这是"库承担复杂度"的典型取舍。
-
-### D2 两种 body 模式**二选一**，不自动切换
-
-`aggregate`（攒完再回调）与 `stream`（分块回调）由 `Parser::Config`
-显式选择。
-
-**为什么不做"超过 N 字节自动转流式"**：那样应用的处理路径取决于报文大小 ——
-同一段代码在小请求上走 A 分支、大请求上走 B 分支，是最难复现的一类 bug。
-宁可让应用自己决定"这个接口会不会收大 body"。
+### D2 body 两种模式**二选一**，不自动切换
+`aggregate`（攒完再回调）/ `stream`（分块回调）由配置显式选。
+不做"超过 N 字节自动转流式"——那样应用路径取决于报文大小，是最难复现的 bug。
 
 ### D3 消息是视图，不是对象
+`HttpRequest` 里全是 `string_view` / `span`，指向解析器缓冲，**回调返回即失效**。
+参考实现是全拷（`SHttpRequest` 里 `std::string url/body`）：省事但每请求多几次分配。
+本库选零拷贝，把"拷贝"这件事留给需要的人显式做。
 
-`HttpRequest` 里全是 `string_view` / `span`，指向解析器缓冲，
-**在回调返回时失效**。
+### D4 自带路由，但只做精确匹配
+参考实现的 `setRoute(method, url, cb)` 是接入方已经习惯的形态，且这层不到 200 行。
+**不做** `:id` 参数、通配符、正则 —— 那是复杂度的真正来源。
 
-**理由**：一条请求最常见的路径是"看一眼就回"。全拷一遍等于每请求多一次
-堆分配 + memcpy。要跨回调保存就自己 `std::string{req.target}` —— 让"拷贝"
-这件事在代码里显式出现。
+> 与参考实现的一处**行为差异**：它用 `ci_map`（大小写不敏感）存路由；
+> HTTP 的 path 按 RFC 9110 是大小写敏感的，本库按规范精确匹配。
+> 迁移时如果现有路由写成 `/API/xxx`，需要统一大小写。
 
-**代价**：唯一的坑是"存了 view 忘了拷"，会在文档与头文件里三处标注。
+### D5 WebSocket 与 HTTP 共用同一端口
+nginx 转发的 WS 也是 HTTP 请求（带 `Upgrade`），所以**不需要协议嗅探**：
+照常走 HTTP 解析，路由里判断是升级请求就调 `upgrade_websocket()`。
+参考实现里的 `ProtocolSniffer`（h2c preface 嗅探）在这里用不上 —— 我们不做 H2。
 
-### D4 `ResponseWriter` 先缓冲，超限自动转 chunked
+### D6 服务端自己实现 WebSocket 帧层
+不引 beast。帧格式（RFC 6455 §5）只有 7 种 opcode + 3 种长度前缀 + mask 位；
+握手需要 SHA-1 + Base64，各约 100 行，一并写在 `src/`。
 
-应用永远只写 `write(...)` + `end()`，不关心是否 chunked。攒够
-`max_buffered_response`（默认 64 KiB）就自动开始分块发送。
+### D7 代理头默认不采信
+`X-Real-IP` 这类头任何人都能伪造。只有连接来自 `ServerConfig::trusted_proxies`
+（默认空 = 全不采信）时，`real_ip()` / `is_forwarded_https()` 才有值。
+nginx 与进程同机时配 `{"127.0.0.1"}`。
 
-**理由**：让"小响应用 Content-Length、大响应自动流式"对应用透明。
-**代价**：`Content-Length` 只在"整条都攒下"时才写得出来；超过阈值后
-报文变 chunked，客户端要能解 —— HTTP/1.1 客户端必须能解，这不是问题。
-
-### D5 客户端：单连接 + 串行队列，不做连接池
-
-**理由**：通信管理机的 HTTP 出站是"往平台上报一包 JSON"，QPS 个位数。
-连接池要处理空闲回收、并发上限、DNS 变更、故障摘除 —— 收益接近零。
-需要并发时建多个 `HttpClient` 即可，各自独立连接。
-
-**代价**：并发请求要自己建多个 client。可接受。
-
-### D6 不做路由
-
-`on_request` 给原始的 `path` / `query` / `method`，路由由应用决定。
-一个几十行的 `if (path == "/api/v1/x")` 比引入路由表 + 参数解析 + 注册
-顺序更可控。
-
-### D7 keep-alive 由库管，pipelining 串行处理
-
-连接复用、`Connection` 头、单连接请求数上限都在库内。
-**pipelining**（一个连接上连发多个请求）不做乱序并发：解析器缓冲里若还有
-下一条的字节，等当前响应写完再解析下一条。响应顺序因此永远是请求顺序 ——
-HTTP/1.1 本来就要求这样，实现简单且不会错序。
-
-### D8 v0.1 不做 TLS
-
-TLS 需要 OpenSSL（或 schannel），会把"零外部依赖、`git clone` 即可构建"
-这个家族约定打破。内网 HTTP 场景（设备配置页、平台上报走内网）暂不需要。
-v0.3 若要加，做法是给 netmech 的连接加一层 `ssl::stream`，httpmech 的
-解析部分完全不动。
+### D8 不做纤程/业务线程池
+回调在 io 线程上跑。耗时操作（查库、写文件、等下游）由接入方丢到自己的线程池，
+库不提供调度器 —— 参考实现的 `TaskFiberPool` 是它自己业务模型的一部分，
+不属于协议层。
 
 ---
 
-## 5. 契约（使用前必读）
+## 5. 契约
 
 ### 生命周期
 
 | 对象 | 有效期 |
 |---|---|
-| `HttpRequest` / `HttpResponse` 里的所有视图 | 回调进入 → 回调返回 |
+| `HttpRequest` / `HttpResponse` 里的视图 | 回调进入 → 回调返回 |
 | `ResponseWriter` | 同一次回调内，不能存 |
-| `Headers::view()` 的结果 | 到下次修改该 `Headers` 为止 |
-| `HttpServer` / `HttpClient` | 由 `shared_ptr` 持有，`stop()`/`close()` 后仍可读统计 |
+| `WebSocketSession` | 库持有 shared_ptr；`is_open()` 为 false 后 `send_*()` 全部返回 false |
+| `Router` 的路由表 | `HttpServer::start()` 之前注册完，运行期只读、不加锁 |
 
 ### 线程
 
 - 同一连接的回调**串行**（继承 netmech "1 io_context = 1 线程"）。
 - 不同连接可能并发；共享状态自己加锁。
-- 回调里不要阻塞；耗时活儿把数据拷出来丢业务线程。
+- `WebSocketSession::send_*()` 可在任意线程调（内部投递到 io 线程）。
 
-### 超时
+### 超时（默认值取自参考实现的经验值）
 
 | 名字 | 默认 | 作用 |
 |---|---|---|
-| `idle_timeout` | 60 s | keep-alive 空闲多久关连接 |
-| `header_timeout` | 10 s | 建连到"请求头收完"，防 slowloris |
+| `idle_timeout` | 60 s | keep-alive 空闲多久关连接（= 参考实现的 keepaliveTimeOut） |
+| `header_timeout` | 10 s | 建连到"请求头收完"（= readTimeOut） |
 | `body_idle_timeout` | 30 s | 流式 body 两次收数据的最大间隔 |
-| `request_timeout`（client） | 10 s | 发出到收完响应 |
-| `connect_timeout`（client） | 3 s | TCP 建连 |
+| `websocket.ping_interval` | 25 s | 主动 ping 间隔 |
+| `websocket.idle_timeout` | 120 s | 这么久没收到任何帧就断 |
 
 ### 资源上限
 
-`Limits` 里四项全部有非零默认值：头字节 32 KiB、头条数 100、
-body 8 MiB（聚合模式）、chunk 行 1 KiB。
-
-### 错误处理策略
-
-| 情况 | 库的行为 |
+| 项 | 默认 |
 |---|---|
-| 请求行/头部语法错 | 回 `400`，`Connection: close`，断开 |
-| 头超限 | 回 `431`，断开 |
-| 聚合模式 body 超限 | 回 `413`，断开 |
-| 不支持的 `Transfer-Encoding` | 回 `501`，断开 |
-| `Content-Length` 与 `Transfer-Encoding` 并存 | 回 `400`（防请求走私），断开 |
-| 应用没调 `end()` | 库补 `500`，记 `Errc::response_incomplete`，断开 |
-| 传输层错误 | 直接断，不回响应（回不了） |
+| 头字节数 | 32 KiB |
+| 头条数 | 100 |
+| 聚合 body | 8 MiB |
+| WS 单帧 | 1 MiB |
+| WS 单消息（跨分片） | 4 MiB |
+| WS 发送队列 | 8 MiB |
+
+### 错误处理
+
+| 情况 | 行为 |
+|---|---|
+| 请求行/头语法错 | `400` + 断开 |
+| 头超限 | `431` + 断开 |
+| 聚合 body 超限 | `413` + 断开 |
+| 路由未匹配 | `404`（可替换） |
+| 路径匹配但方法不符 | `405` + `Allow` 头 |
+| 处理器没调 `end()` | 库补 `500`，记 `response_incomplete`，断开 |
+| `upgrade_websocket()` 失败（非升级请求） | 返回 false，由调用方写 `400` |
+| WS 帧协议错 / 消息超限 | 回 close `1002` / `1009` 后断开 |
 
 ---
 
-## 6. 未实现项（v0.1 明确不做，代码里留了位置）
+## 6. WebSocket 实现要点
+
+| 项 | 处理 |
+|---|---|
+| 握手 | 校验 `Upgrade: websocket`、`Sec-WebSocket-Version: 13`、`Sec-WebSocket-Key` 存在；回 `101` + `Sec-WebSocket-Accept` |
+| 子协议 | `Sec-WebSocket-Protocol` 原样回显第一个（由应用在 handlers 前决定，v0.1 直接回显） |
+| 掩码 | 客户端→服务端**必须**带掩码，服务端→客户端**必须不带**；不合规即 `1002` 断开 |
+| 分片 | `continuation` 帧拼接，累计到 `max_message_bytes` |
+| 控制帧 | `ping` 自动回 `pong`；`close` 走关闭握手；控制帧不可分片、载荷 ≤125 字节 |
+| 关闭 | 收 `close` 回 `close` 再断；主动关闭发 `close` 等回帧或超时 |
+| UTF-8 | 文本帧可选严格校验（默认关，设备侧常发非标准字节） |
+| 扩展 | 不协商任何扩展（`permessage-deflate` 不做） |
+
+---
+
+## 7. 未实现项（v0.1 明确不做）
 
 | 项 | 现状 |
 |---|---|
-| `Expect: 100-continue` | 忽略该头，直接收 body。客户端会在 1 s 后自己开始发，能互通，大 body 多等 1 秒 |
+| `Expect: 100-continue` | 忽略该头，直接收 body（客户端 1 s 后自己发，能互通） |
 | `Trailer` 头 | 解析后丢弃 |
-| 响应压缩 | 不做；`Content-Encoding` 由应用自己设（库不编不编） |
-| Upgrade / WebSocket | `Upgrade` 头可读，握手后协议不实现 |
+| 响应压缩 | 不做（nginx 可代劳） |
+| HTTP/2、gRPC、TLS | 不做（见 §1） |
 
 ---
 
-## 7. 与 rtspmech 的关系
+## 8. 版本规划
 
-**不依赖，但骨架同构**。RTSP 与 HTTP 都是"文本头 + 可选 body"，
-`RtspSession` 的"读 → 解析 → 弱回调 → 写"结构可以直接照搬。
-不能复用的原因：
-
-| | RTSP | HTTP |
-|---|---|---|
-| body | 基本没有，有也很小 | 可能很大，必须流式 |
-| 连接复用 | 一条连接一个会话，长驻 | 一次连接多个请求（keep-alive） |
-| 特殊帧 | `$` 开头的 interleaved 二进制帧 | 无 |
-| chunked | 无 | 必需 |
-
-所以是"同一套骨架，不同的消息状态机"，各自实现更清楚。
+| 版本 | 内容 |
+|---|---|
+| **v0.1** | HTTP/1.1 服务端 + 路由 + WebSocket 服务端 + 代理头识别 |
+| v0.2 | `HttpClient` / `WebSocketClient`（设备主动出站时） |
+| v0.3 | 视需要：连接数/请求数指标导出、`send_file()`（sendfile 或 mmap） |
 
 ---
 
-## 8. 待确认
+## 9. 待确认
 
-1. **`ResponseWriter` 是否要提供 `send_file(path)`**？会牵出 `sendfile`/
-   mmap 与 netmech `write()` 的适配，v0.1 先不做。
-2. **`HttpClient` 是否需要自动重连**（对端 RST 后下次请求自动重连）？
-   当前设计是"下一个请求发现连接没了就重连一次"，不额外做保活探测。
-3. **`Date:` 头用什么时钟**？用系统时间（`std::chrono::system_clock`），
-   设备上时钟不准时 `Date` 会错 —— 是否要允许应用注入一个时间源？
-4. 是否需要 **`Server: httpmech/x.y` 之外的自定义横幅**（安全考虑常要求隐藏）。
+1. **`Sec-WebSocket-Protocol`** 子协议：v0.1 打算"原样回显第一个"，够不够？
+   如果要按子协议选 handler，得让 `websocket(path, handler)` 能拿到请求头（现在能）。
+2. **`after` 钩子的入参**：现在给 `(请求, 状态码)`。做操作日志是否需要 body 大小、
+   耗时？加字段很便宜，但会改签名。
+3. **路由表大小写**：确认要按规范大小写敏感（与参考实现的 `ci_map` 不同）。
+4. **`trusted_proxies` 是否默认 `127.0.0.1`**？默认空最安全但会让现有接入方
+   `real_ip()` 永远为空；默认本地回环更贴合"nginx 同机"的部署，但与安全直觉相反。

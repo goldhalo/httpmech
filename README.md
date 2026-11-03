@@ -1,75 +1,89 @@
 # httpmech
 
-HTTP/1.1 的**协议胶水层**：站在 [netmech](../netmech) 的 TCP 之上，把字节流切成
-一条条 HTTP 消息，再把响应写回去。服务端与客户端共用同一套消息类型与解析器。
+**HTTP/1.1 与 WebSocket 的服务端协议层**：站在 [netmech](../netmech) 的 TCP 之上，
+处理 nginx 转过来的明文请求。TLS、HTTP/2、静态文件都交给 nginx。
 
 > **状态：v0.1 接口草案，尚未实现。**
 > 本仓目前只有 `include/httpmech/*.hpp` 与设计文档，没有 `src/`。
 > 目的是先把接口和契约定下来评审，实现随后补。
-> 设计细节见 **[docs/design.md](docs/design.md)**。
-
----
-
-## 定位
+> 设计细节与"与 wtoe::HttpProtocol 的对照"见 **[docs/design.md](docs/design.md)**。
 
 ```
-应用 ──► httpmech ──► netmech ──► TCP
-         （协议）      （传输）
+浏览器 ──HTTPS/WSS──► nginx ──HTTP/1.1 明文──► httpmech ──► netmech ──► TCP
+                       (TLS 终结)                (本库)
 ```
 
-| 做 | 不做（v0.1） |
+## 范围
+
+| v0.1 做 | v0.1 不做 |
 |---|---|
-| HTTP/1.0、1.1 解析与序列化 | 路由表 / 中间件 |
-| chunked 编解码 | TLS / HTTPS |
-| keep-alive、空闲超时 | HTTP/2 |
-| 流式 body（上传不占内存） | gzip 解压、multipart 语义 |
-| 资源上限（头部/body/chunk） | 静态文件服务、cookie 罐 |
-
-理由与取舍逐条写在 [docs/design.md](docs/design.md) 的「关键设计决策」一节。
+| HTTP/1.1 解析与序列化 | TLS / HTTPS（nginx 终结） |
+| 路由（精确匹配）+ before/after 钩子 | HTTP/2、gRPC |
+| WebSocket（握手 + 帧层 + 分片 + close） | 业务纤程 / 线程池 |
+| keep-alive、流式 body、资源上限 | HTTP / WebSocket 客户端（v0.2） |
+| `X-Real-IP` / `X-AGENT-SSL` 代理头识别 | 静态文件、gzip、multipart |
 
 ---
 
 ## 接口速览
 
-### 服务端
+### HTTP 服务端 + 路由
 
 ```cpp
 #include <httpmech/httpmech.hpp>
 
-class EchoHandler : public httpmech::RequestHandler {
-public:
-    void on_request(const httpmech::HttpRequest& req,
-                    httpmech::ResponseWriter&    out) override
-    {
-        out.set_content_type("application/json");
-        out.write(R"({"ok":true})");
-        out.end();                      // 必须调用
-    }
-};
+auto router = std::make_shared<httpmech::Router>();
 
-auto mech = netmech::Mechanism::create();
+// 鉴权：返回 false 表示已回响应，短路
+router->before([](const httpmech::HttpRequest& req, httpmech::ResponseWriter& out) {
+    if (req.header("Authorization").empty()) {
+        out.end_status(httpmech::Status::unauthorized, "no token");
+        return false;
+    }
+    return true;
+});
+
+router->get("/api/status", [](const httpmech::HttpRequest&, httpmech::ResponseWriter& out) {
+    out.set_content_type("application/json");
+    out.write(R"({"ok":true})");
+    out.end();
+});
+
+// 访问日志
+router->after([](const httpmech::HttpRequest& req, std::uint16_t status) {
+    log("%s %s -> %u", std::string(req.method_text).c_str(),
+        std::string(req.path).c_str(), status);
+});
 
 httpmech::ServerConfig cfg;
-cfg.local = {"0.0.0.0", 8080};
+cfg.local = {"127.0.0.1", 8080};            // 只听 nginx 转过来的
+cfg.trusted_proxies = {"127.0.0.1"};        // 采信本机 nginx 的 X-Real-IP
 
-auto srv = httpmech::HttpServer::create(mech, cfg, std::make_shared<EchoHandler>());
+auto srv = httpmech::HttpServer::create(netmech::Mechanism::create(), cfg, router);
 if (auto ec = srv->start()) { /* 处理错误 */ }
 ```
 
-### 客户端
+### WebSocket
 
 ```cpp
-httpmech::ClientConfig ccfg;
-ccfg.remote = {"192.168.3.10", 9898};
-auto cli = httpmech::HttpClient::create(mech, ccfg);
+httpmech::WebSocketHandlers ws;
 
-httpmech::RequestSpec spec;
-spec.method = httpmech::Method::post;
-spec.target = "/api/v1/report";
-spec.headers.set("Content-Type", "application/json");
-spec.body   = R"({"dev":"m1","p":123.4})";
+ws.on_open = [](httpmech::WebSocketSession& s) {
+    s.send_text(R"({"hello":"world"})");
+};
 
-cli->request(std::move(spec), std::make_shared<MyHandler>());   // 串行队列
+ws.on_message = [](httpmech::WebSocketSession& s,
+                   httpmech::span<const std::uint8_t> data, bool is_text) {
+    if (is_text) {
+        s.send_text(std::string_view{reinterpret_cast<const char*>(data.data()), data.size()});
+    }
+};
+
+ws.on_close = [](httpmech::WebSocketSession&, std::uint16_t code, std::string_view) {
+    log("ws closed: %u", code);
+};
+
+router->websocket("/ws/events", std::move(ws));   // 握手由库完成
 ```
 
 ### 解析器（单独用）
@@ -77,12 +91,10 @@ cli->request(std::move(spec), std::make_shared<MyHandler>());   // 串行队列
 ```cpp
 httpmech::Parser p{httpmech::Parser::Role::server};
 std::error_code ec;
-
-// 可以任意切块喂，包括 1 字节
-auto r = p.feed(httpmech::span{buf, n}, ec);
+auto r = p.feed(httpmech::span{buf, n}, ec);      // 可任意切块喂，包括 1 字节
 if (r == httpmech::Parser::Result::message) {
-    use(p.request());     // 视图，回调返回即失效
-    p.reset();            // 准备下一条（keep-alive）
+    use(p.request());                             // 视图，回调返回即失效
+    p.reset();                                    // 准备下一条（keep-alive）
 }
 ```
 
@@ -93,9 +105,10 @@ if (r == httpmech::Parser::Result::message) {
 1. **视图借用**：`HttpRequest` / `HttpResponse` 里的 `string_view` / `span`
    指向解析器缓冲，**回调返回即失效**。要跨回调保存请自己拷。
 2. **回调串行**：同一连接的回调在该连接的 io 线程上串行，不会并发；
-   不同连接可能并发，共享状态自己加锁。回调里不要阻塞。
-3. **必须 `end()`**：进了 `on_request` / `on_body_end` 就必须以
-   `out.end()` 收尾，否则库补 `500` 并断开。
+   不同连接可能并发，共享状态自己加锁。回调里不要阻塞 —— 耗时活儿丢自己的线程池
+   （本库**不提供**纤程或业务线程调度）。
+3. **必须收尾**：进了处理器就必须以 `out.end()` 或 `out.upgrade_websocket()` 结束，
+   否则库补 `500` 并断开。
 
 ---
 
@@ -107,7 +120,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-交叉编译 aarch64 时把 netmech 的 toolchain 文件一起用：
+交叉编译 aarch64：
 
 ```bash
 cmake -S . -B build-aarch64 \
@@ -118,18 +131,9 @@ cmake -S . -B build-aarch64 \
 ## 安装与在别的项目里使用
 
 ```bash
-cmake --install build          # 默认前缀：Linux /usr/local、Windows C:/Program Files/httpmech
+cmake --install ../netmech/build     # 先装依赖（本仓按家族约定只装自己）
+cmake --install build                # 默认前缀：Linux /usr/local、Windows C:/Program Files/httpmech
 ```
-
-先装 netmech（本仓按家族约定**只装自己**）：
-
-```bash
-cmake -S ../netmech -B ../netmech/build && cmake --build ../netmech/build -j
-cmake --install ../netmech/build
-cmake --install build
-```
-
-然后：
 
 ```cmake
 find_package(httpmech REQUIRED)
@@ -147,14 +151,16 @@ httpmech/
 │   ├── common.hpp         Method / Status / Limits / Errc
 │   ├── span.hpp           只读 span
 │   ├── headers.hpp        HeadersView（借用）/ Headers（拥有）
-│   ├── message.hpp        HttpRequest / HttpResponse
-│   ├── parser.hpp         增量解析器
-│   ├── server.hpp         HttpServer / RequestHandler / ResponseWriter
-│   └── client.hpp         HttpClient / RequestSpec / ResponseHandler
-├── docs/design.md         概要设计
+│   ├── message.hpp        HttpRequest / HttpResponse + 代理头识别
+│   ├── parser.hpp         增量 HTTP 解析器
+│   ├── websocket.hpp      WebSocket 服务端（会话 / 配置 / 握手）
+│   ├── server.hpp         HttpServer / ResponseWriter / RequestHandler
+│   ├── router.hpp         Router：精确路由 + before/after
+│   └── client.hpp         【v0.2 预留，不实现】
+├── docs/design.md         概要设计（含与 wtoe::HttpProtocol 的对照）
 ├── cmake/                 包配置模板
 ├── thirdparty/            picohttpparser（MIT，vendored）
-├── src/                   （待实现）
+├── src/                   （待实现：parser / server / ws 帧层 / sha1-base64）
 ├── test/                  （待实现）
 └── example/               （待实现）
 ```

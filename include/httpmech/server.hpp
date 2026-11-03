@@ -27,6 +27,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <vector>
 
 #include <netmech/common.hpp>
 #include <netmech/mechanism.hpp>
@@ -36,10 +37,12 @@
 #include <httpmech/message.hpp>
 #include <httpmech/parser.hpp>
 #include <httpmech/span.hpp>
+#include <httpmech/websocket.hpp>
 
 namespace httpmech {
 
 class HttpServer;
+class Router;
 
 // =============================================================================
 //  响应写入器
@@ -102,6 +105,31 @@ public:
 
     /// 头部是否已经发出（`write()` 超过缓冲上限、进入 chunked 之后为 true）。
     [[nodiscard]] bool headers_sent() const noexcept;
+
+    /// 升级为 WebSocket。
+    ///
+    /// 由路由自己判断"这是不是升级请求"，然后调本函数。库会：
+    ///   1. 校验 `Upgrade` / `Sec-WebSocket-Key` / `Sec-WebSocket-Version`
+    ///   2. 回 `101 Switching Protocols`
+    ///   3. 之后该连接不再走 HTTP 解析，改由 `handlers` 驱动
+    ///
+    /// @param[in] handlers 三条回调（open / message / close）。
+    /// @param[in] cfg      WS 参数（默认取 `ServerConfig::websocket`）。
+    /// @return true  已接受，连接进入 WS 模式；
+    ///         false 不是合法的升级请求（或已发过响应），**调用方应自己写 400**。
+    ///
+    /// @warning 调用本函数后不要再写任何 HTTP 响应 —— `end()` 会被忽略。
+    bool upgrade_websocket(WebSocketHandlers handlers,
+                           const WebSocketConfig& cfg = WebSocketConfig{});
+
+    /// 是否已经升级为 WebSocket。
+    [[nodiscard]] bool upgraded() const noexcept;
+
+    /// 当前设定的状态码（after 钩子里记访问日志用）。
+    [[nodiscard]] std::uint16_t status_code() const noexcept;
+
+    /// 已写入的 body 字节数。
+    [[nodiscard]] std::size_t body_bytes() const noexcept;
 
     /// 直接断连，不发响应。用于"这个连接我不想再理了"。
     void abort() noexcept;
@@ -204,6 +232,16 @@ struct ServerConfig {
 
     /// 是否在每个响应里写 `Date:`。需要精确时间时必须开（HTTP/1.1 建议）。
     bool emit_date = true;
+
+    /// WebSocket 参数（`upgrade_websocket()` 未显式给 cfg 时用这份）。
+    WebSocketConfig websocket{};
+
+    /// 受信任的反向代理地址。**只有来自这些地址的连接**，`X-Real-IP` /
+    /// `X-Forwarded-*` / `X-AGENT-SSL` 才会被采信，否则视为普通客户端伪造的头。
+    ///
+    /// 支持两种写法：`"127.0.0.1"`（精确）与 IPv4 前缀 `"10.0.0.0/8"`。
+    /// nginx 与本进程同机时写 `{"127.0.0.1"}` 即可；为空表示**不采信**任何代理头。
+    std::vector<std::string> trusted_proxies{};
 };
 
 /// HTTP/1.1 服务端。

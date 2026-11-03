@@ -91,6 +91,35 @@ struct HttpRequest {
     ///       HTTP 允许服务端不回 100，客户端会在 1 秒后自己开始发 —— 能互通，
     ///       只是大 body 场景多等 1 秒。见 docs/design.md「未实现项」。
     [[nodiscard]] bool expects_continue() const noexcept;
+
+    /// 是否 WebSocket 升级请求（`Upgrade: websocket` 且 `Connection` 含 upgrade）。
+    ///
+    /// @note 本库**不自动**升级：要升级必须由路由/处理器显式调用
+    ///       `ResponseWriter::upgrade_websocket()`。这个谓词只是让路由器能提前分流。
+    [[nodiscard]] bool is_websocket_upgrade() const noexcept;
+
+    // --- 反向代理（nginx 前置）---
+
+    /// 本请求是否来自受信任的代理（由 `ServerConfig::trusted_proxy_cidrs` 判定，
+    /// 库在派发前填好）。**为 false 时，下面三个字段一律不采信**。
+    bool from_trusted_proxy = false;
+
+    /// 客户端真实 IP。
+    ///
+    /// 优先级：`X-Real-IP` → `X-Forwarded-For` 的第一个地址 → 空。
+    /// 只有 `from_trusted_proxy` 为 true 才有意义 —— 否则这个头是客户端随便写的。
+    [[nodiscard]] std::string_view real_ip() const noexcept;
+
+    /// 客户端真实端口（`X-Real-PORT`）。缺失返回 0。
+    [[nodiscard]] std::uint16_t real_port() const noexcept;
+
+    /// 原始连接是否为 HTTPS。
+    ///
+    /// 判断依据（nginx 终结 TLS 时的通行做法）：
+    ///   · `X-Forwarded-Proto: https`
+    ///   · `X-AGENT-SSL: 非 0`（现场已有的约定）
+    /// 本端直连且不是 TLS 时恒为 false。
+    [[nodiscard]] bool is_forwarded_https() const noexcept;
 };
 
 // =============================================================================

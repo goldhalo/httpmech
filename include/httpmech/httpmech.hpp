@@ -13,7 +13,11 @@
 #include <httpmech/headers.hpp>
 #include <httpmech/message.hpp>
 #include <httpmech/parser.hpp>
+#include <httpmech/websocket.hpp>
 #include <httpmech/server.hpp>
+#include <httpmech/router.hpp>
+
+// 客户端是 v0.2 的范围，进来只为让接口形状一起评审；v0.1 不实现。
 #include <httpmech/client.hpp>
 
 // 版本号与 httpmech 的 CMake project(VERSION) 保持一致
