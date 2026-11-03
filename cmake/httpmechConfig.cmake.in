@@ -1,0 +1,20 @@
+@PACKAGE_INIT@
+
+# -----------------------------------------------------------------------------
+#  httpmechConfig.cmake —— find_package(httpmech) 的入口
+# -----------------------------------------------------------------------------
+#  用法：
+#      find_package(httpmech REQUIRED)
+#      target_link_libraries(app PRIVATE httpmech::httpmech)
+#
+#  需要先有 netmech 包：HttpServer / HttpClient 的接口上直接用了
+#  netmech::Mechanism 与 netmech::Address。
+# -----------------------------------------------------------------------------
+
+include(CMakeFindDependencyMacro)
+
+find_dependency(netmech)
+
+include("${CMAKE_CURRENT_LIST_DIR}/httpmechTargets.cmake")
+
+check_required_components(httpmech)
