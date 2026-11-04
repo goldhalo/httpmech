@@ -110,8 +110,19 @@ jobs:
           $code = $LASTEXITCODE
           Write-Host $out
           if ($code -ne 0) {
-            $errs = ($out -split "`r?`n" | Where-Object { $_ -match 'CMake Error' } | Select-Object -First 3) -join ' | '
-            if (-not $errs) { $errs = (($out -split "`r?`n") | Where-Object { $_.Trim() -ne '' } | Select-Object -Last 5) -join ' | ' }
+            # 只抓 "CMake Error at ..." 这一行没用（真正的原因在它下面几行），
+            # 把错误行 + 之后 3 行一起打进 annotation。
+            $lines = $out -split "`r?`n"
+            $idx = -1
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+              if ($lines[$i] -match 'CMake Error') { $idx = $i; break }
+            }
+            if ($idx -ge 0) {
+              $end  = [Math]::Min($idx + 3, $lines.Count - 1)
+              $errs = ($lines[$idx..$end] | Where-Object { $_.Trim() -ne '' }) -join ' | '
+            } else {
+              $errs = (($lines | Where-Object { $_.Trim() -ne '' }) | Select-Object -Last 8) -join ' | '
+            }
             Write-Host "::error title=Windows configure failed::$errs"
             exit 1
           }
