@@ -19,6 +19,7 @@ jobs:
   linux:
     name: Linux / ${{ matrix.compiler }} / ${{ matrix.build_type }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -67,7 +68,7 @@ jobs:
 
       - name: 测试
         working-directory: httpmech
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure --timeout 120
 
       - name: 直接运行测试（失败时取详细输出）
         if: failure()
@@ -88,6 +89,7 @@ jobs:
   windows:
     name: Windows / MSVC / ${{ matrix.build_type }}
     runs-on: windows-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -172,6 +174,7 @@ jobs:
   install:
     name: install + find_package
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - name: 检出 httpmech
@@ -233,6 +236,7 @@ jobs:
   quality:
     name: 质量检查
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v4
