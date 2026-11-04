@@ -32,27 +32,42 @@
 ```cpp
 #include <httpmech/httpmech.hpp>
 
+// 挂在请求上的上下文（before 里建，路由和 after 里用）
+struct MyCtx {
+    std::string token;
+    std::string userId;
+    std::chrono::steady_clock::time_point t0;
+};
+
 auto router = std::make_shared<httpmech::Router>();
 
 // 鉴权：返回 false 表示已回响应，短路
-router->before([](const httpmech::HttpRequest& req, httpmech::ResponseWriter& out) {
-    if (req.header("Authorization").empty()) {
+router->before([](httpmech::HttpRequest& req, httpmech::ResponseWriter& out) {
+    auto ctx   = std::make_shared<MyCtx>();
+    ctx->token = std::string(req.header("Authorization"));
+    ctx->t0    = std::chrono::steady_clock::now();
+    if (ctx->token.empty()) {
         out.end_status(httpmech::Status::unauthorized, "no token");
         return false;
     }
+    req.user = ctx;                 // 库不解释这一格，随请求一路带到 after
     return true;
 });
 
-router->get("/api/status", [](const httpmech::HttpRequest&, httpmech::ResponseWriter& out) {
+router->get("/api/status", [](const httpmech::HttpRequest& req, httpmech::ResponseWriter& out) {
+    auto ctx = std::static_pointer_cast<MyCtx>(req.user);   // 取回上下文
     out.set_content_type("application/json");
-    out.write(R"({"ok":true})");
+    out.write(R"({"ok":true,"user":")" + ctx->userId + R"("})");
     out.end();
 });
 
-// 访问日志
-router->after([](const httpmech::HttpRequest& req, std::uint16_t status) {
-    log("%s %s -> %u", std::string(req.method_text).c_str(),
-        std::string(req.path).c_str(), status);
+// 操作日志
+router->after([](const httpmech::HttpRequest& req, const httpmech::ResponseSummary& res) {
+    auto ctx = std::static_pointer_cast<MyCtx>(req.user);
+    log("%s %s -> %u  %zu B  %lld ms  user=%s",
+        std::string(req.method_text).c_str(), std::string(req.path).c_str(),
+        res.status, res.body_bytes,
+        static_cast<long long>(res.elapsed.count()), ctx->userId.c_str());
 });
 
 httpmech::ServerConfig cfg;
@@ -100,7 +115,7 @@ if (r == httpmech::Parser::Result::message) {
 
 ---
 
-## 契约（三条必须记住的）
+## 契约（四条必须记住的）
 
 1. **视图借用**：`HttpRequest` / `HttpResponse` 里的 `string_view` / `span`
    指向解析器缓冲，**回调返回即失效**。要跨回调保存请自己拷。
@@ -109,6 +124,8 @@ if (r == httpmech::Parser::Result::message) {
    （本库**不提供**纤程或业务线程调度）。
 3. **必须收尾**：进了处理器就必须以 `out.end()` 或 `out.upgrade_websocket()` 结束，
    否则库补 `500` 并断开。
+4. **`req.user` 是应用自留地**：库从不读取、不解释；`before` → 路由 → `after`
+   传的是同一个 `HttpRequest`，所以这一格是通的。
 
 ---
 

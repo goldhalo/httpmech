@@ -142,6 +142,23 @@ private:
 };
 
 // =============================================================================
+//  响应摘要
+// =============================================================================
+
+/// 一次响应的结果摘要，交给 `after` 钩子（记访问/操作日志用）。
+///
+/// @note 这里刻意**不是**完整的 `HttpResponse`：`after` 在响应已经写出、
+///       视图可能已失效之后才调用，能可靠给出的是这几个标量。
+///       需要更多信息（URL、token、用户）请走 `HttpRequest::user`。
+struct ResponseSummary {
+    std::uint16_t status      = 0;      ///< 实际发出的状态码（兜底的 500 也算）
+    std::size_t   body_bytes  = 0;      ///< 写入的 body 字节数
+    bool          upgraded    = false;  ///< 是否升级成了 WebSocket（此时 status = 101）
+    bool          keep_alive  = false;  ///< 这个连接是否被复用
+    std::chrono::milliseconds elapsed{0};   ///< 从收到请求头到响应写完
+};
+
+// =============================================================================
 //  应用回调
 // =============================================================================
 
@@ -160,9 +177,12 @@ public:
 
     /// 一条请求处理完毕（聚合模式）。
     ///
-    /// @param[in] req 请求视图，回调返回后失效。
-    /// @param[in] out 响应写入器，**必须** 以 `out.end()` 结束。
-    virtual void on_request(const HttpRequest& req, ResponseWriter& out) = 0;
+    /// @param[in,out] req 请求视图，回调返回后失效。
+    ///                    传**非 const 引用**是为了让处理器能挂
+    ///                    `req.user`（见 `HttpRequest::user`），其它字段
+    ///                    视同只读。`before` 钩子与处理器拿到的是同一个对象。
+    /// @param[in]     out 响应写入器，**必须** 以 `out.end()` 结束。
+    virtual void on_request(HttpRequest& req, ResponseWriter& out) = 0;
 
     // --- 以下是流式模式的可选实现（聚合模式下不会被调用）---
 
@@ -170,20 +190,20 @@ public:
     ///
     /// @return true  继续接收 body（会依次来 `on_body_data`）；
     ///         false 立刻回 `413 Payload Too Large` 并断开（省带宽的拒收）。
-    virtual bool on_headers(const HttpRequest& req, ResponseWriter& out)
+    virtual bool on_headers(HttpRequest& req, ResponseWriter& out)
     {
         (void)req; (void)out;
         return true;
     }
 
     /// 一块 body。`data` 指向解析器缓冲，返回即失效，要留请拷。
-    virtual void on_body_data(const HttpRequest& req, span<const std::uint8_t> data)
+    virtual void on_body_data(HttpRequest& req, span<const std::uint8_t> data)
     {
         (void)req; (void)data;
     }
 
     /// body 收完，在这里写响应（必须有 `out.end()`）。
-    virtual void on_body_end(const HttpRequest& req, ResponseWriter& out)
+    virtual void on_body_end(HttpRequest& req, ResponseWriter& out)
     {
         (void)req; (void)out;
     }
@@ -240,8 +260,11 @@ struct ServerConfig {
     /// `X-Forwarded-*` / `X-AGENT-SSL` 才会被采信，否则视为普通客户端伪造的头。
     ///
     /// 支持两种写法：`"127.0.0.1"`（精确）与 IPv4 前缀 `"10.0.0.0/8"`。
-    /// nginx 与本进程同机时写 `{"127.0.0.1"}` 即可；为空表示**不采信**任何代理头。
-    std::vector<std::string> trusted_proxies{};
+    ///
+    /// @note 默认 `{"127.0.0.1"}` —— 贴合"nginx 与进程同机"这个实际部署形态，
+    ///       使 `real_ip()` 开箱即用。若要更严格（例如 nginx 在另一台机器上、
+    ///       或压根没有代理），显式改成对应的代理地址，或置空表示**完全不采信**。
+    std::vector<std::string> trusted_proxies{"127.0.0.1"};
 };
 
 /// HTTP/1.1 服务端。

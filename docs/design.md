@@ -126,6 +126,24 @@ nginx 与进程同机时配 `{"127.0.0.1"}`。
 库不提供调度器 —— 参考实现的 `TaskFiberPool` 是它自己业务模型的一部分，
 不属于协议层。
 
+### D9 请求上留一格 `shared_ptr<void>`，响应给一个摘要
+
+**问题**：`after` 钩子要记操作日志，需要"这次请求是谁、花了多久、回了多少"，
+而这些东西分布在 before（鉴权结果）和响应阶段（状态码、字节数）。
+
+**选择**：
+- `HttpRequest::user`（`std::shared_ptr<void>`）—— 库**从不读取**，也不解释其语义。
+  `before` 里 `req.user = ctx;` 挂上自己的上下文类，路由与 `after` 里
+  `static_pointer_cast` 取回。三个回调传的是同一个 `HttpRequest` 对象。
+- `after` 的第二个参数是 `ResponseSummary`（状态码 / body 字节数 / 耗时 /
+  是否升级 / 是否复用），而不是完整的 `HttpResponse` —— 响应已经写出，
+  视图可能失效，能可靠给的只有这几个标量。
+
+**为什么不直接给一个 `SHttpResponse` 那样的响应对象**：本库的响应是
+**写入器**（`ResponseWriter`），因为要支持流式 body、超限自动 chunked、
+以及中途升级成 WebSocket —— 这些都不是"先攒一个值再发"能表达的。
+值语义的响应体留给 v0.2 的客户端（`HttpResponse` 已经存在，是**解析结果**）。
+
 ---
 
 ## 5. 契约
@@ -136,6 +154,7 @@ nginx 与进程同机时配 `{"127.0.0.1"}`。
 |---|---|
 | `HttpRequest` / `HttpResponse` 里的视图 | 回调进入 → 回调返回 |
 | `ResponseWriter` | 同一次回调内，不能存 |
+| `HttpRequest::user` | `before` 写入 → `after` 返回后随请求一起释放 |
 | `WebSocketSession` | 库持有 shared_ptr；`is_open()` 为 false 后 `send_*()` 全部返回 false |
 | `Router` 的路由表 | `HttpServer::start()` 之前注册完，运行期只读、不加锁 |
 
@@ -217,12 +236,20 @@ nginx 与进程同机时配 `{"127.0.0.1"}`。
 
 ---
 
-## 9. 待确认
+## 9. 已确认的决定（2026-11-04）
 
-1. **`Sec-WebSocket-Protocol`** 子协议：v0.1 打算"原样回显第一个"，够不够？
-   如果要按子协议选 handler，得让 `websocket(path, handler)` 能拿到请求头（现在能）。
-2. **`after` 钩子的入参**：现在给 `(请求, 状态码)`。做操作日志是否需要 body 大小、
-   耗时？加字段很便宜，但会改签名。
-3. **路由表大小写**：确认要按规范大小写敏感（与参考实现的 `ci_map` 不同）。
-4. **`trusted_proxies` 是否默认 `127.0.0.1`**？默认空最安全但会让现有接入方
-   `real_ip()` 永远为空；默认本地回环更贴合"nginx 同机"的部署，但与安全直觉相反。
+| 问题 | 决定 |
+|---|---|
+| WebSocket 子协议 | v0.1 **原样回显**第一个 `Sec-WebSocket-Protocol`，不做子协议路由 |
+| `after` 钩子入参 | 给 `ResponseSummary`（状态码 / body 字节数 / 耗时 / 是否升级 / 是否复用）；请求级上下文走 `HttpRequest::user`（`shared_ptr<void>`，库不解释） |
+| 路由大小写 | **按规范**：路径大小写敏感、精确匹配 |
+| `trusted_proxies` 默认值 | `{"127.0.0.1"}` —— 贴合"nginx 与进程同机"的实际部署，`real_ip()` 开箱即用 |
+
+### 与参考实现的落地差异汇总
+
+| 项 | 参考实现 | httpmech | 影响 |
+|---|---|---|---|
+| 请求上下文 | `SHttpRequest::userPtr` | `HttpRequest::user` | 同构 |
+| 响应入参 | `SHttpResponse&`（可写值） | `ResponseWriter&` + `ResponseSummary` | 支持流式/chunked/升级 |
+| 路由大小写 | 不敏感（`ci_map`） | 敏感（RFC 9110） | 迁移时统一大小写 |
+| 代理头 | 无条件采信 | 白名单（默认仅本地回环） | 防客户端伪造身份 |

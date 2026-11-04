@@ -43,7 +43,7 @@ namespace httpmech {
 /// @code
 /// auto router = std::make_shared<httpmech::Router>();
 ///
-/// router->before([](const httpmech::HttpRequest& req, httpmech::ResponseWriter& out) {
+/// router->before([](httpmech::HttpRequest& req, httpmech::ResponseWriter& out) {
 ///     if (!check_token(req.header("Authorization"))) {
 ///         out.end_status(httpmech::Status::unauthorized, "no token");
 ///         return false;              // 短路，不再走路由
@@ -55,6 +55,12 @@ namespace httpmech {
 ///     out.set_content_type("application/json");
 ///     out.write(R"({"ok":true})");
 ///     out.end();
+/// });
+///
+/// router->after([](const httpmech::HttpRequest& req,
+///                  const httpmech::ResponseSummary& res) {
+///     log("%s %s -> %u (%zu B, %lld ms)", ..., res.status, res.body_bytes,
+///         static_cast<long long>(res.elapsed.count()));
 /// });
 ///
 /// router->websocket("/ws/events", handlers);
@@ -69,13 +75,22 @@ class Router : public RequestHandler,
                public std::enable_shared_from_this<Router> {
 public:
     /// 处理函数。`out` 必须以 `end()` 或 `upgrade_websocket()` 收尾。
+    ///
+    /// @note 请求按 **const 引用**传入：路由只读。要挂上下文（token、用户、
+    ///       计时起点）请在 `before` 钩子里写 `req.user`，这里读出来用。
     using Handler = std::function<void(const HttpRequest&, ResponseWriter&)>;
 
-    /// 前置钩子。返回 false 表示已自行回响应，不再往下走。
-    using BeforeHook = std::function<bool(const HttpRequest&, ResponseWriter&)>;
+    /// 前置钩子（鉴权）。返回 false 表示已自行回响应，不再往下走。
+    ///
+    /// @note 请求按**非 const 引用**传入 —— 这是唯一能写 `req.user` 的地方，
+    ///       写进去的对象会一路传到路由与 `after`。
+    using BeforeHook = std::function<bool(HttpRequest&, ResponseWriter&)>;
 
-    /// 后置钩子（记访问日志用）。`status` 是本次响应的状态码。
-    using AfterHook = std::function<void(const HttpRequest&, std::uint16_t status)>;
+    /// 后置钩子（记访问/操作日志）。
+    ///
+    /// @param[in] req 这条请求；`req.user` 仍可用（before 里挂的上下文还在）。
+    /// @param[in] res 响应摘要（状态码、body 字节数、耗时、是否升级、是否复用）。
+    using AfterHook = std::function<void(const HttpRequest&, const ResponseSummary&)>;
 
     Router();
     ~Router() override;
@@ -102,7 +117,7 @@ public:
 
     // --- RequestHandler ---
 
-    void on_request(const HttpRequest& req, ResponseWriter& out) override;
+    void on_request(HttpRequest& req, ResponseWriter& out) override;
 
     [[nodiscard]] std::size_t route_count() const noexcept;
     [[nodiscard]] std::size_t websocket_route_count() const noexcept;

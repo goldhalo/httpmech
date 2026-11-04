@@ -19,6 +19,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string_view>
 
@@ -97,6 +98,39 @@ struct HttpRequest {
     /// @note 本库**不自动**升级：要升级必须由路由/处理器显式调用
     ///       `ResponseWriter::upgrade_websocket()`。这个谓词只是让路由器能提前分流。
     [[nodiscard]] bool is_websocket_upgrade() const noexcept;
+
+    // --- 请求级用户数据 ---
+
+    /// 应用自用的一格。**库从不读取、也不释放它的语义**。
+    ///
+    /// 典型用法是把"这次请求的上下文"挂在 `before` 钩子里，供后续路由与
+    /// `after` 钩子使用（比如鉴权结果、耗时统计的起点、操作日志需要的字段）：
+    ///
+    /// @code
+    /// router->before([](httpmech::HttpRequest& req, httpmech::ResponseWriter& out) {
+    ///     auto ctx = std::make_shared<MyCtx>();
+    ///     ctx->token  = std::string(req.header("Authorization"));
+    ///     ctx->userId = verify(ctx->token);
+    ///     if (ctx->userId.empty()) { out.end_status(httpmech::Status::unauthorized); return false; }
+    ///     req.user = ctx;                       // 挂上
+    ///     return true;
+    /// });
+    ///
+    /// router->get("/api/x", [](const httpmech::HttpRequest& req, httpmech::ResponseWriter& out) {
+    ///     auto ctx = std::static_pointer_cast<MyCtx>(req.user);   // 取回
+    ///     ...
+    /// });
+    ///
+    /// router->after([](const httpmech::HttpRequest& req, const httpmech::ResponseSummary& res) {
+    ///     auto ctx = std::static_pointer_cast<MyCtx>(req.user);   // 记日志
+    ///     ...
+    /// });
+    /// @endcode
+    ///
+    /// @note 同一条请求的 `before` → 路由 → `after` 传的是**同一个**
+    ///       `HttpRequest` 对象（引用透传），所以这一格是通的。
+    ///       到了 `after` 返回，这个 shared_ptr 随请求一起释放。
+    std::shared_ptr<void> user;
 
     // --- 反向代理（nginx 前置）---
 
