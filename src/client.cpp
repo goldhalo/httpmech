@@ -23,6 +23,7 @@
 #include <netmech/iohandler.hpp>
 #include <netmech/linkable.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <deque>

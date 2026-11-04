@@ -344,6 +344,18 @@ jobs:
           fi
           echo "✅ 无 Boost / OpenSSL 依赖"
 
+      - name: 检查对外头文件不依赖 Asio
+        run: |
+          # 装出去的包**不带 Asio**（公共头一行 asio 都不引，asio 只在 src/ 里用）。
+          # 一旦有人在 include/ 里加回 `#include <asio/...>`，使用者就得自己装
+          # 一套 Asio 才编得过 —— 这条检查用来守住这个边界。
+          if grep -rnE '^[[:space:]]*#[[:space:]]*include[[:space:]]*<(asio|asio\.hpp)' \
+               include/ --include='*.hpp'; then
+            echo "❌ 对外头文件包含了 asio（装出去的包不该依赖它）"
+            exit 1
+          fi
+          echo "✅ 对外头文件无 asio 依赖"
+
       - name: 检查每个对外头文件可单独包含
         run: |
           sudo apt-get update && sudo apt-get install -y g++
