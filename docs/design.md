@@ -264,7 +264,7 @@ nginx 与进程同机时配 `{"127.0.0.1"}`。
 | `parser` | ✅ | 增量解析、chunked、pipelining、两种 body 模式；单元测试 100+ 断言 |
 | `server` | ✅ | netmech 接线、keep-alive、超时清理、协议错误响应、`real_ip()` 白名单 |
 | `router` | ✅ | 精确路由 + before/after + 405/Allow |
-| `websocket` | ⏳ | **握手与帧层未实现**；`upgrade_websocket()` 目前恒返回 false，路由回 `501` |
+| `websocket` | ✅ | 握手（SHA-1 + Base64 自带）、帧层、分片、ping/pong、close 握手、空闲与 ping 定时 |
 | `client` | ⏳ | v0.2 |
 
 ### 与设计稿的偏差（实现时发现，已在代码注释里标出）
@@ -319,3 +319,85 @@ Content-Type: application/json
 
 netmech 侧新增 4 个用例（端口取回、只停目标监听、端口可复用、不误伤其它监听），
 62 个用例 / 791 个断言全过。
+
+---
+
+## 12. WebSocket 实现记录（v0.1 完成）
+
+自带 SHA-1（RFC 3174）+ Base64（RFC 4648），不引 OpenSSL。
+
+| 项 | 处理 |
+|---|---|
+| 握手 | 校验 `Upgrade` / `Connection` / `Sec-WebSocket-Version: 13` / `Sec-WebSocket-Key`；回 `101` |
+| 子协议 | 原样回显第一个 `Sec-WebSocket-Protocol` |
+| 掩码 | 客户端→服务端**必须**带掩码，否则 `1002` 断开；服务端发出的帧不打掩码 |
+| 长度 | 7 / 16 / 64 位三档都支持 |
+| 分片 | `continuation` 拼接到 `max_message_bytes`，超了 `1009` |
+| 控制帧 | `ping` 自动回 `pong`；控制帧不可分片、载荷 ≤125 |
+| 关闭 | 收 `close` 回声同码再断；主动 `close` 等对端 2 秒超时兜底 |
+| 保活 | `ping_interval` 主动 ping；`idle_timeout` 无帧即断 |
+
+### 两个非得靠端到端测试才现形的 bug
+
+1. **升级后 HTTP 解析器还在跑**。
+   `pump()` 是"解析-派发"的循环，升级成 WS 之后 `finish_writer` 提前返回、
+   没有 `reset()`，解析器停在 `done` 状态，`next()` 一直返回 `message`
+   → **同一个请求被派发了 9 次**，每次都在升级。现象是客户端一个字节都收不到
+   （服务端在死循环里）。修法：派发后 `if (m_is_ws) return;`。
+
+2. **"写完就关"被实现成了"立刻关"**。
+   `on_read` 里看到 `m_close_after_write` 就 `close_now()`，于是 close 帧
+   还没写出去连接就被掐了 —— 对端看到的是 abnormal closure。
+   修法：`on_read` 不关，交给 `on_write` 在写完成后再关。
+
+这两条都是"看代码觉得没问题、跑起来立刻现形"的类型，也再次说明
+端到端测试不能省。
+
+### 测试
+
+`websocket accept`：RFC 6455 §1.3 的官方例子（key → 固定 accept 值）。
+
+`websocket e2e`：起真服务端 + 原始 socket，覆盖
+握手 → on_open 主动推送 → 文本回显 → 二进制回显（16 位长度）→
+ping/pong → 两帧分片拼成一条消息 → close 握手回声。
+
+---
+
+## 12. WebSocket 实现记录（v0.1 完成）
+
+自带 SHA-1（RFC 3174）+ Base64（RFC 4648），不引 OpenSSL。
+
+| 项 | 处理 |
+|---|---|
+| 握手 | 校验 `Upgrade` / `Connection` / `Sec-WebSocket-Version: 13` / `Sec-WebSocket-Key`；回 `101` |
+| 子协议 | 原样回显第一个 `Sec-WebSocket-Protocol` |
+| 掩码 | 客户端→服务端**必须**带掩码，否则 `1002` 断开；服务端发出的帧不打掩码 |
+| 长度 | 7 / 16 / 64 位三档都支持 |
+| 分片 | `continuation` 拼接到 `max_message_bytes`，超了 `1009` |
+| 控制帧 | `ping` 自动回 `pong`；控制帧不可分片、载荷 ≤125 |
+| 关闭 | 收 `close` 回声同码再断；主动 `close` 等对端 2 秒超时兜底 |
+| 保活 | `ping_interval` 主动 ping；`idle_timeout` 无帧即断 |
+
+### 两个非得靠端到端测试才现形的 bug
+
+1. **升级后 HTTP 解析器还在跑**。
+   `pump()` 是"解析-派发"的循环，升级成 WS 之后 `finish_writer` 提前返回、
+   没有 `reset()`，解析器停在 `done` 状态，`next()` 一直返回 `message`
+   → **同一个请求被派发了 9 次**，每次都在升级。现象是客户端一个字节都收不到
+   （服务端在死循环里）。修法：派发后 `if (m_is_ws) return;`。
+
+2. **"写完就关"被实现成了"立刻关"**。
+   `on_read` 里看到 `m_close_after_write` 就 `close_now()`，于是 close 帧
+   还没写出去连接就被掐了 —— 对端看到的是 abnormal closure。
+   修法：`on_read` 不关，交给 `on_write` 在写完成后再关。
+
+这两条都是"看代码觉得没问题、跑起来立刻现形"的类型，也再次说明
+端到端测试不能省。
+
+### 测试
+
+`websocket accept`：RFC 6455 §1.3 的官方例子（key → 固定 accept 值）。
+
+`websocket e2e`：起真服务端 + 原始 socket，覆盖
+握手 → on_open 主动推送 → 文本回显 → 二进制回显（16 位长度）→
+ping/pong → 两帧分片拼成一条消息 → close 握手回声。

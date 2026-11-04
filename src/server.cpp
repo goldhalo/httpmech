@@ -18,6 +18,8 @@
 // =============================================================================
 #include <httpmech/server.hpp>
 
+#include "ws_internal.hpp"
+
 #include <netmech/conn.hpp>
 #include <netmech/iohandler.hpp>
 #include <netmech/linkable.hpp>
@@ -46,6 +48,7 @@ class ServerSession;
 
 struct ResponseWriter::Impl {
     detail::ServerSession* session  = nullptr;
+    const HttpRequest*     request  = nullptr;
     Status                 status   = Status::ok;
     std::uint16_t          code     = 200;
     std::string            reason;
@@ -158,14 +161,23 @@ public:
         m_busy          = true;
 
         const auto* p = static_cast<const std::uint8_t*>(buf.data);
-        m_parser.feed(span<const std::uint8_t>{p, n}, m_ec);
-        pump();
+        if (m_is_ws) {
+            if (m_ws) {
+                m_ws->on_bytes(span<const std::uint8_t>{p, n});
+            }
+        } else {
+            m_parser.feed(span<const std::uint8_t>{p, n}, m_ec);
+            pump();
+        }
 
         m_busy = false;
-        if (m_closed.load(std::memory_order_relaxed) || m_close_after_write) {
-            if (m_close_after_write) {
-                close_now();
-            }
+        if (m_closed.load(std::memory_order_relaxed)) {
+            return;
+        }
+        if (m_close_after_write) {
+            // 有"写完就关"的报文在队列里：**不能在这里关**，
+            // 否则那帧还没写出去就被掐断（WS 的 close 帧就栽在这上面）。
+            // 交给 on_write：写完成后由它收尾。
             return;
         }
         if (!start_read()) {
@@ -178,11 +190,19 @@ public:
         m_pending_writes.pop_front();
         if (ec) {
             close_now();
+            return;
+        }
+        // "写完就关"的报文已经落地，现在才真正关连接
+        if (m_close_after_write) {
+            close_now();
         }
     }
 
     void on_close() override
     {
+        if (m_ws) {
+            m_ws->on_transport_closed();
+        }
         m_conn.reset();
         if (!m_closed.exchange(true)) {
             m_owner->conns.fetch_sub(1, std::memory_order_relaxed);
@@ -196,14 +216,36 @@ public:
         if (m_closed.load(std::memory_order_relaxed) || m_busy) {
             return;
         }
+        if (m_is_ws) {
+            if (m_ws) {
+                m_ws->tick(std::chrono::steady_clock::now());
+            }
+            return;   // WS 的空闲超时由 WebSocketConfig 管
+        }
         if (std::chrono::steady_clock::now() - m_last_activity > idle) {
             close_now();
         }
     }
 
-    // --- ResponseWriter 调用 ---
+    // --- ResponseWriter / WebSocket 调用 ---
 
     void send(std::string wire, bool close_after);
+
+    /// 帧层发原始字节。返回 false 表示连接已不可写。
+    bool send_bytes(std::string wire, bool close_after)
+    {
+        if (!m_conn || m_closed.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        send(std::move(wire), close_after);
+        return !m_closed.load(std::memory_order_relaxed);
+    }
+
+    /// 升级为 WebSocket：建帧层会话并回调 on_open。
+    ///
+    /// @param[in] headers_raw 握手请求的头部原文（供 handshake_header() 查）
+    bool switch_to_websocket(WebSocketHandlers handlers, WebSocketConfig wcfg,
+                             std::string path, std::string real_ip, std::string headers_raw);
 
     void close_now() noexcept
     {
@@ -241,6 +283,10 @@ private:
     httpmech::Parser            m_parser;
     std::error_code             m_ec;
     ResponseWriter::Impl        m_writer;
+
+    /// 升级成 WebSocket 之后，字节不再进 HTTP 解析器
+    bool                                        m_is_ws = false;
+    std::shared_ptr<detail::WsSessionImpl>      m_ws;
 
     std::shared_ptr<std::vector<char>>       m_read_buf;
     std::deque<std::shared_ptr<std::string>> m_pending_writes;   // 保活到写完成
@@ -383,6 +429,11 @@ void ServerSession::pump()
 
         case httpmech::Parser::Result::message:
             dispatch_aggregate();
+            if (m_is_ws) {
+                // 已经升级成 WebSocket：HTTP 解析器退出舞台，
+                // 后面的字节全部交给帧层（on_read 里分流）。
+                return;
+            }
             if (m_closed.load(std::memory_order_relaxed) || m_close_after_write) {
                 return;
             }
@@ -414,6 +465,7 @@ void ServerSession::dispatch_aggregate()
     req.from_trusted_proxy = is_trusted_proxy(m_peer, m_owner->cfg.trusted_proxies);
 
     m_writer.reset_for_request(req.method == Method::head);
+    m_writer.request = &req;
 
     m_owner->requests.fetch_add(1, std::memory_order_relaxed);
     ++m_served;
@@ -432,6 +484,7 @@ void ServerSession::dispatch_stream_events(span<const std::uint8_t> body, bool i
     if (!m_stream_headers_done) {
         m_stream_headers_done = true;
         m_writer.reset_for_request(req.method == Method::head);
+        m_writer.request = &req;
         m_owner->requests.fetch_add(1, std::memory_order_relaxed);
         ++m_served;
 
@@ -537,12 +590,46 @@ void ServerSession::finish_writer(bool keep_alive)
 
     send(std::move(wire), !ka);
 
-    // 为下一条请求做准备（keep-alive）
-    if (ka) {
+    // 为下一条请求做准备（keep-alive）。升级成 WebSocket 之后不适用。
+    if (ka && !m_is_ws) {
         m_parser.reset();
         m_writer.reset_for_request(false);
         m_stream_headers_done = false;
     }
+}
+
+bool ServerSession::switch_to_websocket(WebSocketHandlers handlers, WebSocketConfig wcfg,
+                                        std::string path, std::string real_ip,
+                                        std::string headers_raw)
+{
+    if (m_is_ws || !m_conn) {
+        return false;
+    }
+
+    std::weak_ptr<ServerSession> weak = weak_from_this();
+
+    detail::WsIo io;
+    io.send = [weak](std::string wire, bool close_after) -> bool {
+        if (auto self = weak.lock()) {
+            return self->send_bytes(std::move(wire), close_after);
+        }
+        return false;
+    };
+    io.close = [weak] {
+        if (auto self = weak.lock()) {
+            self->close_now();
+        }
+    };
+
+    m_ws = std::make_shared<detail::WsSessionImpl>(
+        std::move(io), std::move(wcfg), std::move(handlers), std::move(path), std::move(real_ip),
+        m_peer, std::move(headers_raw));
+    m_is_ws = true;
+
+    // 进 WS 模式后，HTTP 解析器不再使用；缓冲里若有残留字节（pipelining）
+    // 直接丢弃 —— 升级之后协议已经变了。
+    m_ws->start();
+    return true;
 }
 
 void ServerSession::send(std::string wire, bool close_after)
@@ -845,12 +932,74 @@ void ResponseWriter::abort() noexcept
     }
 }
 
-bool ResponseWriter::upgrade_websocket(WebSocketHandlers /*handlers*/,
-                                       const WebSocketConfig& /*cfg*/)
+bool ResponseWriter::upgrade_websocket(WebSocketHandlers handlers, const WebSocketConfig* cfg)
 {
-    // WebSocket 帧层与握手在下一阶段实现（见 docs/design.md §6）。
-    // 这里显式返回 false，让路由回 501，而不是假装升级成功。
-    return false;
+    if (m_impl->sent || m_impl->aborted || m_impl->upgraded) {
+        return false;
+    }
+    if (m_impl->session == nullptr || m_impl->request == nullptr) {
+        return false;
+    }
+
+    const HttpRequest& req = *m_impl->request;
+    if (!req.is_websocket_upgrade()) {
+        return false;
+    }
+    // 只支持 13（RFC 6455）。老草案版本（8 / 7）不认。
+    if (!iequals(trim_ows(req.header("Sec-WebSocket-Version")), "13")) {
+        return false;
+    }
+    const auto key = trim_ows(req.header("Sec-WebSocket-Key"));
+    if (key.empty()) {
+        return false;
+    }
+
+    const std::string accept = make_websocket_accept(key);
+
+    // 子协议：按约定原样回显第一个
+    std::string sub;
+    {
+        const auto proto = req.header("Sec-WebSocket-Protocol");
+        const auto comma = proto.find(',');
+        sub = std::string{trim_ows(comma == std::string_view::npos ? proto : proto.substr(0, comma))};
+    }
+
+    std::string resp;
+    resp.reserve(256);
+    resp += "HTTP/1.1 101 Switching Protocols\r\n";
+    resp += "Upgrade: websocket\r\n";
+    resp += "Connection: Upgrade\r\n";
+    resp += "Sec-WebSocket-Accept: ";
+    resp += accept;
+    resp += "\r\n";
+    if (!sub.empty()) {
+        resp += "Sec-WebSocket-Protocol: ";
+        resp += sub;
+        resp += "\r\n";
+    }
+    resp += "\r\n";
+
+    // 握手请求头原文，供 WebSocketSession::handshake_header()
+    std::string raw;
+    for (std::size_t i = 0; i < req.headers.size(); ++i) {
+        const auto f = req.headers.all()[i];
+        raw.append(f.name.data(), f.name.size());
+        raw += ": ";
+        raw.append(f.value.data(), f.value.size());
+        raw += "\r\n";
+    }
+
+    m_impl->sent     = true;   // 后面 finish_writer 不会再补一个响应
+    m_impl->upgraded = true;
+
+    m_impl->session->send(std::move(resp), false);
+
+    const WebSocketConfig& wcfg =
+        (cfg != nullptr) ? *cfg : m_impl->session->cfg().websocket;
+
+    return m_impl->session->switch_to_websocket(
+        std::move(handlers), wcfg, std::string{req.path},
+        std::string{req.real_ip()}, std::move(raw));
 }
 
 } // namespace httpmech

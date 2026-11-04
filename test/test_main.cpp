@@ -42,6 +42,18 @@ const char* g_case = "";
         }                                                                        \
     } while (0)
 
+/// 条件为假时记录失败并**直接返回**（后续代码不可执行时用）
+#define REQUIRE(expr)                                                            \
+    do {                                                                         \
+        ++g_checks;                                                              \
+        if (!(expr)) {                                                           \
+            ++g_fails;                                                           \
+            std::printf("    FAIL [%s] %s:%d  REQUIRE %s\n", g_case, __FILE__,    \
+                        __LINE__, #expr);                                        \
+            return;                                                              \
+        }                                                                        \
+    } while (0)
+
 using httpmech::span;
 
 std::string to_str(span<const std::uint8_t> s)
@@ -285,6 +297,14 @@ void test_headers_container()
     CHECK_EQ(h.size(), std::size_t{2});
 }
 
+void test_websocket_accept()
+{
+    g_case = "websocket accept";
+    // RFC 6455 §1.3 的官方例子
+    CHECK_EQ(httpmech::make_websocket_accept("dGhlIHNhbXBsZSBub25jZQ=="),
+             std::string{"s3pPLMBiTxaQ9kYGzzhZRbK+xOo="});
+}
+
 void test_status()
 {
     g_case = "status helpers";
@@ -353,6 +373,218 @@ std::string tcp_roundtrip(int fd, const std::string& req)
         }
     }
     return resp;
+}
+
+// --- WebSocket 用的原始收发 ---
+
+bool tcp_send_all(int fd, const std::string& data)
+{
+    std::size_t sent = 0;
+    while (sent < data.size()) {
+        const ssize_t n = ::send(fd, data.data() + sent, data.size() - sent, 0);
+        if (n <= 0) {
+            return false;
+        }
+        sent += static_cast<std::size_t>(n);
+    }
+    return true;
+}
+
+bool tcp_recv_exact(int fd, char* out, std::size_t n)
+{
+    std::size_t got = 0;
+    while (got < n) {
+        const ssize_t r = ::recv(fd, out + got, n - got, 0);
+        if (r <= 0) {
+            return false;
+        }
+        got += static_cast<std::size_t>(r);
+    }
+    return true;
+}
+
+/// 构造一帧（客户端 → 服务端必须打掩码）
+std::string ws_build_frame(std::uint8_t opcode, const std::string& payload, bool fin = true)
+{
+    std::string f;
+    f.push_back(static_cast<char>((fin ? 0x80 : 0x00) | opcode));
+
+    const std::uint8_t mask_bit = 0x80;
+    if (payload.size() < 126) {
+        f.push_back(static_cast<char>(mask_bit | payload.size()));
+    } else {
+        f.push_back(static_cast<char>(mask_bit | 126));
+        f.push_back(static_cast<char>((payload.size() >> 8) & 0xFF));
+        f.push_back(static_cast<char>(payload.size() & 0xFF));
+    }
+    const std::uint8_t key[4] = {0x37, 0xFA, 0x21, 0x3D};
+    f.append(reinterpret_cast<const char*>(key), 4);
+    for (std::size_t i = 0; i < payload.size(); ++i) {
+        f.push_back(static_cast<char>(static_cast<std::uint8_t>(payload[i]) ^ key[i % 4]));
+    }
+    return f;
+}
+
+/// 读一帧；失败返回 false
+bool ws_read_frame(int fd, std::uint8_t& opcode, std::string& payload)
+{
+    unsigned char hdr[2];
+    if (!tcp_recv_exact(fd, reinterpret_cast<char*>(hdr), 2)) {
+        return false;
+    }
+    opcode = static_cast<std::uint8_t>(hdr[0] & 0x0F);
+    const bool masked = (hdr[1] & 0x80) != 0;
+    std::uint64_t len = hdr[1] & 0x7F;
+    if (len == 126) {
+        unsigned char ext[2];
+        if (!tcp_recv_exact(fd, reinterpret_cast<char*>(ext), 2)) {
+            return false;
+        }
+        len = (static_cast<std::uint64_t>(ext[0]) << 8) | ext[1];
+    } else if (len == 127) {
+        unsigned char ext[8];
+        if (!tcp_recv_exact(fd, reinterpret_cast<char*>(ext), 8)) {
+            return false;
+        }
+        len = 0;
+        for (int i = 0; i < 8; ++i) {
+            len = (len << 8) | ext[i];
+        }
+    }
+    unsigned char key[4] = {0, 0, 0, 0};
+    if (masked && !tcp_recv_exact(fd, reinterpret_cast<char*>(key), 4)) {
+        return false;
+    }
+    payload.assign(static_cast<std::size_t>(len), '\0');
+    if (len != 0 && !tcp_recv_exact(fd, &payload[0], static_cast<std::size_t>(len))) {
+        return false;
+    }
+    if (masked) {
+        for (std::size_t i = 0; i < payload.size(); ++i) {
+            payload[i] = static_cast<char>(static_cast<std::uint8_t>(payload[i]) ^ key[i % 4]);
+        }
+    }
+    return true;
+}
+
+void test_websocket_e2e()
+{
+    g_case = "websocket e2e";
+
+    httpmech::ServerConfig cfg;
+    cfg.local       = {"127.0.0.1", 0};
+    cfg.emit_date   = false;
+    cfg.server_name = "httpmech-ut";
+
+    auto router = std::make_shared<httpmech::Router>();
+
+    httpmech::WebSocketHandlers ws;
+    ws.on_open = [](httpmech::WebSocketSession& s) { s.send_text("welcome"); };
+    ws.on_message = [](httpmech::WebSocketSession& s,
+                       httpmech::span<const std::uint8_t> data, bool is_text) {
+        if (is_text) {
+            s.send_text(std::string_view{reinterpret_cast<const char*>(data.data()), data.size()});
+        } else {
+            s.send_binary(data);
+        }
+    };
+    router->websocket("/ws", std::move(ws));
+
+    auto mech = netmech::Mechanism::create();
+    auto srv  = httpmech::HttpServer::create(mech, cfg, router);
+    REQUIRE(srv != nullptr);
+    REQUIRE(!srv->start());
+    const std::uint16_t port = srv->local().port();
+    REQUIRE(port != 0);
+
+    const int fd = tcp_connect("127.0.0.1", port);
+    REQUIRE(fd >= 0);
+
+    // --- 握手 ---
+    const std::string key = "dGhlIHNhbXBsZSBub25jZQ==";
+    const std::string req =
+        "GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\n"
+        "Connection: Upgrade\r\nSec-WebSocket-Key: " + key + "\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n";
+    REQUIRE(tcp_send_all(fd, req));
+
+    std::string head;
+    char        c = 0;
+    while (head.find("\r\n\r\n") == std::string::npos) {
+        if (!tcp_recv_exact(fd, &c, 1)) {
+            break;
+        }
+        head.push_back(c);
+    }
+    CHECK(head.rfind("HTTP/1.1 101", 0) == 0);
+    // RFC 6455 §1.3 的例子：这个 key 对应的 accept 是固定值
+    CHECK(head.find("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") != std::string::npos);
+
+    // --- on_open 主动发的欢迎消息 ---
+    {
+        std::uint8_t op = 0;
+        std::string  payload;
+        REQUIRE(ws_read_frame(fd, op, payload));
+        CHECK_EQ(static_cast<int>(op), 0x1);
+        CHECK_EQ(payload, std::string{"welcome"});
+    }
+
+    // --- 文本回显 ---
+    REQUIRE(tcp_send_all(fd, ws_build_frame(0x1, "ping-text")));
+    {
+        std::uint8_t op = 0;
+        std::string  payload;
+        REQUIRE(ws_read_frame(fd, op, payload));
+        CHECK_EQ(static_cast<int>(op), 0x1);
+        CHECK_EQ(payload, std::string{"ping-text"});
+    }
+
+    // --- 二进制回显（含 126~65535 的长度前缀）---
+    {
+        std::string big(300, 'x');
+        REQUIRE(tcp_send_all(fd, ws_build_frame(0x2, big)));
+        std::uint8_t op = 0;
+        std::string  payload;
+        REQUIRE(ws_read_frame(fd, op, payload));
+        CHECK_EQ(static_cast<int>(op), 0x2);
+        CHECK_EQ(payload.size(), big.size());
+    }
+
+    // --- ping 自动回 pong ---
+    REQUIRE(tcp_send_all(fd, ws_build_frame(0x9, "hb")));
+    {
+        std::uint8_t op = 0;
+        std::string  payload;
+        REQUIRE(ws_read_frame(fd, op, payload));
+        CHECK_EQ(static_cast<int>(op), 0xA);
+        CHECK_EQ(payload, std::string{"hb"});
+    }
+
+    // --- 分片：两段拼成一条消息 ---
+    {
+        REQUIRE(tcp_send_all(fd, ws_build_frame(0x1, "he", false)));
+        REQUIRE(tcp_send_all(fd, ws_build_frame(0x0, "llo", true)));
+        std::uint8_t op = 0;
+        std::string  payload;
+        REQUIRE(ws_read_frame(fd, op, payload));
+        CHECK_EQ(static_cast<int>(op), 0x1);
+        CHECK_EQ(payload, std::string{"hello"});
+    }
+
+    // --- close 握手 ---
+    {
+        std::string close_payload;
+        close_payload.push_back(static_cast<char>(0x03));
+        close_payload.push_back(static_cast<char>(0xE8));   // 1000
+        REQUIRE(tcp_send_all(fd, ws_build_frame(0x8, close_payload)));
+        std::uint8_t op = 0;
+        std::string  payload;
+        CHECK(ws_read_frame(fd, op, payload));
+        CHECK_EQ(static_cast<int>(op), 0x8);
+    }
+
+    ::close(fd);
+    srv->stop();
 }
 
 void test_server_e2e()
@@ -469,9 +701,11 @@ int main()
         {"limits",              test_limits},
         {"proxy headers",       test_proxy_headers},
         {"headers container",   test_headers_container},
+        {"websocket accept",    test_websocket_accept},
         {"status",              test_status},
 #if !defined(_WIN32)
         {"server e2e",          test_server_e2e},
+        {"websocket e2e",       test_websocket_e2e},
 #endif
     };
 

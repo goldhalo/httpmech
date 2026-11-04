@@ -117,13 +117,13 @@ public:
     ///   3. 之后该连接不再走 HTTP 解析，改由 `handlers` 驱动
     ///
     /// @param[in] handlers 三条回调（open / message / close）。
-    /// @param[in] cfg      WS 参数（默认取 `ServerConfig::websocket`）。
-    /// @return true  已接受，连接进入 WS 模式；
+    /// @param[in] cfg      WS 参数；**传 nullptr 表示用 `ServerConfig::websocket`**。
+    /// @return true  已接受：`101` 已发出，连接进入 WS 模式，`on_open` 已回调；
     ///         false 不是合法的升级请求（或已发过响应），**调用方应自己写 400**。
     ///
     /// @warning 调用本函数后不要再写任何 HTTP 响应 —— `end()` 会被忽略。
     bool upgrade_websocket(WebSocketHandlers handlers,
-                           const WebSocketConfig& cfg = WebSocketConfig{});
+                           const WebSocketConfig* cfg = nullptr);
 
     /// 是否已经升级为 WebSocket。
     [[nodiscard]] bool upgraded() const noexcept;

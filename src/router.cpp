@@ -86,7 +86,7 @@ void Router::on_request(HttpRequest& req, ResponseWriter& out)
         for (auto& w : d.ws_routes) {
             if (w.path == req.path) {
                 ws_matched = true;
-                if (!out.upgrade_websocket(w.handlers, WebSocketConfig{})) {
+                if (!out.upgrade_websocket(w.handlers)) {
                     // 不是合法升级请求，或本版本尚未实现 WS
                     out.set_status(Status::not_implemented);
                     out.end_status(Status::not_implemented, "websocket not available");
