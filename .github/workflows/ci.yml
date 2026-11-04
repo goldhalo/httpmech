@@ -247,7 +247,19 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v4
+      # 注意：httpmech 依赖同级的 ../netmech，必须像其它 job 一样把两个仓
+      # 都检出到同一个 workspace（httpmech/ 与 netmech/）。
+      # 只检出本仓时 ../netmech 不存在，配置阶段直接 FATAL_ERROR。
+      - name: 检出 httpmech
+        uses: actions/checkout@v4
+        with:
+          path: httpmech
+
+      - name: 检出 netmech（依赖）
+        uses: actions/checkout@v4
+        with:
+          repository: goldhalo/netmech
+          path: netmech
 
       - name: 安装工具
         run: |
@@ -255,6 +267,7 @@ jobs:
           sudo apt-get install -y cmake ninja-build g++
 
       - name: 配置（Debug + sanitizer）
+        working-directory: httpmech
         run: |
           cmake -S . -B build-san -G Ninja \
                 -DCMAKE_BUILD_TYPE=Debug \
@@ -264,9 +277,11 @@ jobs:
                 -DHTTPMECH_BUILD_TESTS=ON
 
       - name: 构建
+        working-directory: httpmech
         run: cmake --build build-san --parallel
 
       - name: 测试（sanitizer 一旦报错立即失败）
+        working-directory: httpmech
         env:
           ASAN_OPTIONS: detect_leaks=0:abort_on_error=1:strict_string_checks=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
