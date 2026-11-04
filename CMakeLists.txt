@@ -94,19 +94,14 @@ if(HTTPMECH_WARNINGS_AS_ERRORS)
 endif()
 
 # ---------------------------------------------------------------------------
-# 5. picohttpparser（C，vendored）
+# 5. picohttpparser（vendored，编进本库）
 # ---------------------------------------------------------------------------
-add_library(picohttpparser STATIC
-    thirdparty/picohttpparser/picohttpparser.c)
-target_include_directories(picohttpparser PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/picohttpparser>
-    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/httpmech/thirdparty>)
-set_target_properties(picohttpparser PROPERTIES
-    FOLDER "httpmech/thirdparty"
-    POSITION_INDEPENDENT_CODE ${HTTPMECH_PIC})
-target_compile_options(picohttpparser PRIVATE
-    $<$<C_COMPILER_ID:MSVC>:/wd4244 /wd4267>
-    $<$<NOT:$<C_COMPILER_ID:MSVC>>:-w>)
+#  它**只**是 parser 的实现细节，所以不再单独出 `libpicohttpparser.a`：
+#     · 发布物只有 libhttpmech.a 一个库文件；
+#     · 公开头目录里不出现 picohttpparser.h；
+#     · 符号经 src/pico_rename.hpp 加了 httpmech_ 前缀，和 rtspmech 各自内嵌
+#       一份也不会在链接期撞车。
+#  源码由 src/pico_impl.cpp 以 C++ 方式编入（见该文件的说明）。
 
 # ---------------------------------------------------------------------------
 # 6. 主库
@@ -140,15 +135,23 @@ if(NOT HTTPMECH_IS_INTERFACE)
 
     target_link_libraries(httpmech
         PUBLIC  netmech
-        PRIVATE picohttpparser
         PRIVATE httpmech_compile_options)
+
+    # pico 的头只在本库内部可见（parser.cpp 用 <picohttpparser.h>）
+    target_include_directories(httpmech PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/picohttpparser")
+
+    # 第三方代码不参与"告警当错误"：语法是上游的，改不动也不该改。
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/pico_impl.cpp"
+        PROPERTIES COMPILE_OPTIONS
+        "$<$<CXX_COMPILER_ID:MSVC>:/w>$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-w>")
 else()
     target_include_directories(httpmech INTERFACE
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 
     target_link_libraries(httpmech INTERFACE
-        netmech picohttpparser httpmech_compile_options)
+        netmech httpmech_compile_options)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -181,8 +184,8 @@ endif()
 #  装完之后使用者只需要：
 #      find_package(httpmech REQUIRED)
 #      target_link_libraries(app PRIVATE httpmech::httpmech)
-#  netmech 由 Config 里的 find_dependency 找；picohttpparser 随包安装，
-#  以 $<LINK_ONLY:> 形式挂在导出的 target 上。
+#  netmech 由 Config 里的 find_dependency 找；picohttpparser 已编进本库，
+#  **不再作为独立的库随包安装**（使用方只需要链 libhttpmech.a 一个文件）。
 if(NOT HTTPMECH_IS_INTERFACE)
     install(TARGETS httpmech
             EXPORT httpmechTargets
@@ -193,7 +196,7 @@ else()
     install(TARGETS httpmech EXPORT httpmechTargets)
 endif()
 
-install(TARGETS picohttpparser httpmech_compile_options
+install(TARGETS httpmech_compile_options
         EXPORT httpmechTargets
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 
@@ -201,9 +204,11 @@ install(DIRECTORY include/httpmech
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
         FILES_MATCHING PATTERN "*.hpp")
 
-install(DIRECTORY thirdparty/picohttpparser/
-        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/httpmech/thirdparty
-        FILES_MATCHING PATTERN "*.h")
+# picohttpparser 的头**不装**：它已被编进 libhttpmech.a，属于实现细节。
+# 但 MIT 要求分发时保留版权声明，所以把它的许可证随文档一起装。
+install(FILES thirdparty/picohttpparser/LICENSE
+        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/httpmech
+        RENAME LICENSE.picohttpparser)
 
 install(EXPORT httpmechTargets
         FILE httpmechTargets.cmake

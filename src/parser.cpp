@@ -22,6 +22,10 @@
 #include <string>
 #include <vector>
 
+// 必须先包含 rename：pico 的符号在本库里带 httpmech_ 前缀，
+// 这样和 rtspmech 各自内嵌一份时不会在链接期撞车。
+#include "pico_rename.hpp"
+
 #include <picohttpparser.h>
 
 namespace httpmech {
