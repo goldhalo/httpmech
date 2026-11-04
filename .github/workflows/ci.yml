@@ -1,0 +1,229 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch:
+
+# httpmech 依赖同级的 ../netmech，所以两个仓都检出到同一个 workspace：
+#   $GITHUB_WORKSPACE/httpmech   ← 本仓
+#   $GITHUB_WORKSPACE/netmech    ← 依赖
+# CMake 默认就在 ../netmech 找它，不用额外传 -DHTTPMECH_NETMECH_DIR。
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Linux / GCC + Clang
+  # ---------------------------------------------------------------------------
+  linux:
+    name: Linux / ${{ matrix.compiler }} / ${{ matrix.build_type }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        build_type: [Debug, Release]
+
+    steps:
+      - name: 检出 httpmech
+        uses: actions/checkout@v4
+        with:
+          path: httpmech
+
+      - name: 检出 netmech（依赖）
+        uses: actions/checkout@v4
+        with:
+          repository: goldhalo/netmech
+          path: netmech
+
+      - name: 安装工具
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+          if [ "${{ matrix.compiler }}" = "gcc" ]; then
+            sudo apt-get install -y g++
+          else
+            sudo apt-get install -y clang++
+          fi
+
+      - name: 配置
+        working-directory: httpmech
+        run: |
+          if [ "${{ matrix.compiler }}" = "gcc" ]; then
+            export CC=gcc CXX=g++
+          else
+            export CC=clang CXX=clang++
+          fi
+          cmake -S . -B build -G Ninja \
+                -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+                -DHTTPMECH_WARNINGS_AS_ERRORS=ON
+
+      - name: 构建
+        working-directory: httpmech
+        run: cmake --build build --parallel
+
+      - name: 测试
+        working-directory: httpmech
+        run: ctest --test-dir build --output-on-failure
+
+      - name: 直接运行测试（失败时取详细输出）
+        if: failure()
+        working-directory: httpmech
+        run: ./build/bin/httpmech_ut || true
+
+  # ---------------------------------------------------------------------------
+  # Windows / MSVC
+  #   e2e 用例是 POSIX socket，Windows 上会被 #if 掉；这里主要验证
+  #   MSVC 能编过（/utf-8、/W4、模板实例化），以及纯逻辑单测能跑。
+  # ---------------------------------------------------------------------------
+  windows:
+    name: Windows / MSVC / ${{ matrix.build_type }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+
+    steps:
+      - name: 检出 httpmech
+        uses: actions/checkout@v4
+        with:
+          path: httpmech
+
+      - name: 检出 netmech（依赖）
+        uses: actions/checkout@v4
+        with:
+          repository: goldhalo/netmech
+          path: netmech
+
+      - name: 配置
+        working-directory: httpmech
+        run: >
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          -DHTTPMECH_WARNINGS_AS_ERRORS=ON
+
+      - name: 构建
+        working-directory: httpmech
+        run: cmake --build build --config ${{ matrix.build_type }} --parallel
+
+      - name: 测试
+        working-directory: httpmech
+        shell: pwsh
+        run: |
+          & ".\build\bin\${{ matrix.build_type }}\httpmech_ut.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  # ---------------------------------------------------------------------------
+  # 安装 / find_package 冒烟测试
+  #   装到临时前缀，再写一个最小消费者工程用 find_package 找到它。
+  #   这条能抓住"能编过但装出去用不了"的一类问题（路径、EXPORT、依赖）。
+  # ---------------------------------------------------------------------------
+  install:
+    name: install + find_package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出 httpmech
+        uses: actions/checkout@v4
+        with:
+          path: httpmech
+
+      - name: 检出 netmech（依赖）
+        uses: actions/checkout@v4
+        with:
+          repository: goldhalo/netmech
+          path: netmech
+
+      - name: 安装 netmech 与 httpmech
+        run: |
+          sudo apt-get update && sudo apt-get install -y cmake ninja-build g++
+          cmake -S netmech -B netmech/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/tmp/pfx -DNETMECH_BUILD_TESTS=OFF -DNETMECH_BUILD_EXAMPLES=OFF
+          cmake --build netmech/build --parallel
+          cmake --install netmech/build
+
+          cmake -S httpmech -B httpmech/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/tmp/pfx -DHTTPMECH_BUILD_TESTS=OFF -DHTTPMECH_BUILD_EXAMPLES=OFF
+          cmake --build httpmech/build --parallel
+          cmake --install httpmech/build
+
+      - name: 消费者工程（find_package）
+        run: |
+          mkdir -p /tmp/consumer
+          cat > /tmp/consumer/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.16)
+          project(consumer CXX)
+          set(CMAKE_CXX_STANDARD 17)
+          find_package(httpmech REQUIRED)
+          add_executable(app main.cpp)
+          target_link_libraries(app PRIVATE httpmech::httpmech)
+          EOF
+
+          cat > /tmp/consumer/main.cpp <<'EOF'
+          #include <httpmech/httpmech.hpp>
+          int main()
+          {
+              // 只用到不需要实现的纯函数，验证头文件 + 链接路径都对
+              return httpmech::make_websocket_accept("dGhlIHNhbXBsZSBub25jZQ==") ==
+                             "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+                         ? 0
+                         : 1;
+          }
+          EOF
+
+          cmake -S /tmp/consumer -B /tmp/consumer/build -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/tmp/pfx
+          cmake --build /tmp/consumer/build
+          /tmp/consumer/build/app
+
+  # ---------------------------------------------------------------------------
+  # 质量门禁
+  # ---------------------------------------------------------------------------
+  quality:
+    name: 质量检查
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 检查禁止的 C++20 特性
+        run: |
+          FAIL=0
+          for pat in 'co_await' 'co_return' 'co_yield' 'std::span' 'std::format' \
+                     'std::jthread' 'std::atomic_ref' '\bconcept\b' '\branges::' '<=>'; do
+            if grep -rEn "$pat" include/ src/ example/ test/ \
+                 --include='*.hpp' --include='*.cpp' 2>/dev/null; then
+              echo "❌ 发现禁止的构造: $pat"
+              FAIL=1
+            fi
+          done
+          if [ $FAIL -eq 1 ]; then exit 1; fi
+          echo "✅ 未发现 C++20 构造"
+
+      - name: 检查不得引入 Boost / OpenSSL
+        run: |
+          if grep -rn -e 'boost::' -e 'openssl/' include/ src/ example/ test/ \
+               --include='*.hpp' --include='*.cpp' | grep -v '^\s*//'; then
+            echo "❌ 发现 boost:: 或 openssl 引用（本库零外部依赖）"
+            exit 1
+          fi
+          echo "✅ 无 Boost / OpenSSL 依赖"
+
+      - name: 检查每个对外头文件可单独包含
+        run: |
+          sudo apt-get update && sudo apt-get install -y g++
+          git clone --depth 1 https://github.com/goldhalo/netmech /tmp/netmech
+          FAIL=0
+          for h in include/httpmech/*.hpp; do
+            name=$(basename "$h" .hpp)
+            printf '#include <httpmech/%s.hpp>\nint main(){return 0;}\n' "$name" > /tmp/one.cpp
+            if ! g++ -std=c++17 -fsyntax-only -Wall -Wextra \
+                 -Iinclude -I/tmp/netmech/include -I/tmp/netmech/thirdparty/asio/include \
+                 /tmp/one.cpp; then
+              echo "❌ $name.hpp 不能单独包含"
+              FAIL=1
+            fi
+          done
+          if [ $FAIL -eq 1 ]; then exit 1; fi
+          echo "✅ 全部头文件自包含"

@@ -8,7 +8,9 @@
 #include <string>
 #include <vector>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#    include <windows.h>
+#else
 #    include <arpa/inet.h>
 #    include <netinet/in.h>
 #    include <sys/socket.h>
@@ -467,6 +469,100 @@ bool ws_read_frame(int fd, std::uint8_t& opcode, std::string& payload)
     return true;
 }
 
+// =============================================================================
+//  Connection: close —— 应答必须完整送达，且以 FIN 收尾（不能是 RST）
+// =============================================================================
+void test_connection_close_delivery()
+{
+    g_case = "connection close delivery";
+
+    httpmech::ServerConfig cfg;
+    cfg.local     = {"127.0.0.1", 0};
+    cfg.emit_date = false;
+
+    auto router = std::make_shared<httpmech::Router>();
+
+    // 8 KiB 的 body：足够大到需要分多次 write，逼近内核缓冲区边界
+    const std::string payload(8 * 1024, 'z');
+    router->get("/big", [payload](const httpmech::HttpRequest&,
+                                  httpmech::ResponseWriter& out) {
+        out.set_content_type("text/plain");
+        out.write(payload);
+        out.end();
+    });
+
+    auto mech = netmech::Mechanism::create();
+    auto srv  = httpmech::HttpServer::create(mech, cfg, router);
+    REQUIRE(srv != nullptr);
+    REQUIRE(!srv->start());
+
+    const int fd = tcp_connect("127.0.0.1", srv->local().port());
+    REQUIRE(fd >= 0);
+
+    REQUIRE(tcp_send_all(fd,
+        "GET /big HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"));
+
+    // 一直读到 EOF
+    std::string resp;
+    char        buf[4096];
+    bool        clean_eof = false;
+    for (;;) {
+        const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+        if (n > 0) {
+            resp.append(buf, static_cast<std::size_t>(n));
+            continue;
+        }
+        // n == 0 → 正常 FIN；n < 0 → 超时或 RST
+        clean_eof = (n == 0);
+        break;
+    }
+
+    CHECK(clean_eof);   // 如果是 RST，这里会是 false（ECONNRESET）
+    CHECK(resp.find("HTTP/1.1 200 OK") != std::string::npos);
+    CHECK(resp.find("Connection: close") != std::string::npos);
+    // 正文必须一个字节都不少
+    CHECK(resp.size() >= payload.size());
+    CHECK(resp.compare(resp.size() - payload.size(), payload.size(), payload) == 0);
+
+    ::close(fd);
+    srv->stop();
+}
+
+// =============================================================================
+//  linger_zero 拦截：SO_LINGER{1,0} 会丢最后那一包，必须在启动时拦住
+// =============================================================================
+void test_linger_zero_guard()
+{
+    g_case = "linger_zero guard";
+
+    auto router = std::make_shared<httpmech::Router>();
+    router->get("/", [](const httpmech::HttpRequest&, httpmech::ResponseWriter& out) {
+        out.end_status(httpmech::Status::ok, "ok");
+    });
+
+    // 用 linger_zero = true 建 Mechanism：HTTP 会拒绝启动
+    netmech::Mechanism::Config mcfg;
+    mcfg.linger_zero = true;
+    auto mech_bad    = netmech::Mechanism::create(mcfg);
+
+    httpmech::ServerConfig cfg;
+    cfg.local = {"127.0.0.1", 0};
+
+    auto srv = httpmech::HttpServer::create(mech_bad, cfg, router);
+    REQUIRE(srv != nullptr);
+    const auto ec = srv->start();
+    CHECK(ec == httpmech::make_error_code(httpmech::Errc::linger_zero_enabled));
+    CHECK(!srv->running());
+
+    // 显式放开后允许启动（自己承担丢应答的风险）
+    httpmech::ServerConfig cfg2 = cfg;
+    cfg2.allow_linger_zero      = true;
+    auto srv2 = httpmech::HttpServer::create(mech_bad, cfg2, router);
+    REQUIRE(srv2 != nullptr);
+    CHECK(!srv2->start());
+    srv2->stop();
+}
+
 void test_websocket_e2e()
 {
     g_case = "websocket e2e";
@@ -678,6 +774,10 @@ void test_server_e2e()
 
 int main()
 {
+#if defined(_WIN32)
+    // Windows 控制台默认是 GBK 代码页，源码里的中文按 UTF-8 输出会乱码
+    ::SetConsoleOutputCP(CP_UTF8);
+#endif
     std::printf("---- httpmech 单元测试 ----\n");
 
 #if !defined(_WIN32)
@@ -705,6 +805,8 @@ int main()
         {"status",              test_status},
 #if !defined(_WIN32)
         {"server e2e",          test_server_e2e},
+        {"connection close",    test_connection_close_delivery},
+        {"linger_zero guard",   test_linger_zero_guard},
         {"websocket e2e",       test_websocket_e2e},
 #endif
     };

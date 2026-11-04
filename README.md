@@ -1,116 +1,186 @@
 # httpmech
 
-**HTTP/1.1 与 WebSocket 的服务端协议层**：站在 [netmech](../netmech) 的 TCP 之上，
-处理 nginx 转过来的明文请求。TLS、HTTP/2、静态文件都交给 nginx。
+[![CI](https://github.com/goldhalo/httpmech/actions/workflows/ci.yml/badge.svg)](https://github.com/goldhalo/httpmech/actions/workflows/ci.yml)
 
-> **状态：v0.1 接口草案，尚未实现。**
-> 本仓目前只有 `include/httpmech/*.hpp` 与设计文档，没有 `src/`。
-> 目的是先把接口和契约定下来评审，实现随后补。
-> 设计细节与"与 wtoe::HttpProtocol 的对照"见 **[docs/design.md](docs/design.md)**。
+**HTTP/1.1 与 WebSocket 的服务端协议层**，基于 [netmech](../netmech) 的 TCP。
+TLS、HTTP/2、静态文件都交给前面的 nginx，本库只处理它转过来的明文请求。
 
 ```
 浏览器 ──HTTPS/WSS──► nginx ──HTTP/1.1 明文──► httpmech ──► netmech ──► TCP
                        (TLS 终结)                (本库)
 ```
 
-## 范围
-
-| v0.1 做 | v0.1 不做 |
-|---|---|
-| HTTP/1.1 解析与序列化 | TLS / HTTPS（nginx 终结） |
-| 路由（精确匹配）+ before/after 钩子 | HTTP/2、gRPC |
-| WebSocket（握手 + 帧层 + 分片 + close） | 业务纤程 / 线程池 |
-| keep-alive、流式 body、资源上限 | HTTP / WebSocket 客户端（v0.2） |
-| `X-Real-IP` / `X-AGENT-SSL` 代理头识别 | 静态文件、gzip、multipart |
+- 自带路由、before/after 钩子、WebSocket（握手 + 帧层），**零外部依赖**
+- C++17，不引 Boost / OpenSSL；WebSocket 握手用的 SHA-1 + Base64 也是自带的
+- 172 个断言（单元 + 端到端），CI 覆盖 Linux（gcc/clang × Debug/Release）与 Windows MSVC
 
 ---
 
-## 接口速览
+## 范围
 
-### HTTP 服务端 + 路由
+| 做 | 不做 |
+|---|---|
+| HTTP/1.1 解析与序列化、chunked 请求体 | TLS / HTTPS（nginx 终结） |
+| 路由（精确匹配）+ before/after 钩子 | HTTP/2、gRPC |
+| WebSocket（握手、帧层、分片、ping/pong、close） | 业务纤程 / 线程池 |
+| keep-alive、流式 body、资源上限 | HTTP / WebSocket 客户端（v0.2） |
+| `X-Real-IP` / `X-AGENT-SSL` 代理头识别（白名单） | 静态文件、gzip、multipart |
+
+设计取舍见 **[docs/design.md](docs/design.md)**（含与 wtoe::HttpProtocol 的对照）。
+
+---
+
+## 完整示例
+
+下面这段就是 `example/hello_server.cpp` 的实质内容，可直接编译运行：
 
 ```cpp
 #include <httpmech/httpmech.hpp>
+#include <chrono>
+#include <cstdio>
+#include <thread>
 
-// 挂在请求上的上下文（before 里建，路由和 after 里用）
-struct MyCtx {
-    std::string token;
-    std::string userId;
-    std::chrono::steady_clock::time_point t0;
-};
-
-auto router = std::make_shared<httpmech::Router>();
-
-// 鉴权：返回 false 表示已回响应，短路
-router->before([](httpmech::HttpRequest& req, httpmech::ResponseWriter& out) {
-    auto ctx   = std::make_shared<MyCtx>();
-    ctx->token = std::string(req.header("Authorization"));
-    ctx->t0    = std::chrono::steady_clock::now();
-    if (ctx->token.empty()) {
-        out.end_status(httpmech::Status::unauthorized, "no token");
-        return false;
+int main()
+{
+    if (!netmech::initialize(0)) {                // 启动 netmech 的 io 线程池
+        std::fprintf(stderr, "netmech initialize 失败\n");
+        return 1;
     }
-    req.user = ctx;                 // 库不解释这一格，随请求一路带到 after
-    return true;
-});
 
-router->get("/api/status", [](const httpmech::HttpRequest& req, httpmech::ResponseWriter& out) {
-    auto ctx = std::static_pointer_cast<MyCtx>(req.user);   // 取回上下文
-    out.set_content_type("application/json");
-    out.write(R"({"ok":true,"user":")" + ctx->userId + R"("})");
-    out.end();
-});
+    auto router = std::make_shared<httpmech::Router>();
 
-// 操作日志
-router->after([](const httpmech::HttpRequest& req, const httpmech::ResponseSummary& res) {
-    auto ctx = std::static_pointer_cast<MyCtx>(req.user);
-    log("%s %s -> %u  %zu B  %lld ms  user=%s",
-        std::string(req.method_text).c_str(), std::string(req.path).c_str(),
-        res.status, res.body_bytes,
-        static_cast<long long>(res.elapsed.count()), ctx->userId.c_str());
-});
+    // ---- 鉴权：before 返回 false 表示已回响应，后续不再走 ----
+    router->before([](httpmech::HttpRequest& req, httpmech::ResponseWriter& out) {
+        const auto token = req.header("Authorization");
+        if (token.empty()) {
+            out.end_status(httpmech::Status::unauthorized, "missing token");
+            return false;
+        }
+        req.user = std::make_shared<std::string>(token);   // 挂给后面用
+        return true;
+    });
 
-httpmech::ServerConfig cfg;
-cfg.local = {"127.0.0.1", 8080};            // 只听 nginx 转过来的
-cfg.trusted_proxies = {"127.0.0.1"};        // 采信本机 nginx 的 X-Real-IP
+    // ---- 一个 GET ----
+    router->get("/api/status", [](const httpmech::HttpRequest& req,
+                                  httpmech::ResponseWriter& out) {
+        out.set_content_type("application/json");
+        out.write(std::string{R"({"ok":true,"path":")"} + std::string{req.path} + R"("})");
+        out.end();
+    });
 
-auto srv = httpmech::HttpServer::create(netmech::Mechanism::create(), cfg, router);
-if (auto ec = srv->start()) { /* 处理错误 */ }
-```
+    // ---- 一个 POST：读 body 再回写 ----
+    router->post("/api/echo", [](const httpmech::HttpRequest& req,
+                                 httpmech::ResponseWriter& out) {
+        out.set_content_type("application/octet-stream");
+        out.write(req.body);
+        out.end();
+    });
 
-### WebSocket
+    // ---- WebSocket ----
+    httpmech::WebSocketHandlers ws;
+    ws.on_open = [](httpmech::WebSocketSession& s) { s.send_text("welcome"); };
+    ws.on_message = [](httpmech::WebSocketSession& s,
+                       httpmech::span<const std::uint8_t> data, bool is_text) {
+        if (is_text) {
+            s.send_text(std::string_view{reinterpret_cast<const char*>(data.data()), data.size()});
+        } else {
+            s.send_binary(data);
+        }
+    };
+    ws.on_close = [](httpmech::WebSocketSession&, std::uint16_t code, std::string_view) {
+        std::printf("ws closed: %u\n", code);
+    };
+    router->websocket("/ws/echo", std::move(ws));
 
-```cpp
-httpmech::WebSocketHandlers ws;
+    // ---- 访问日志：after 拿到响应摘要 ----
+    router->after([](const httpmech::HttpRequest& req, const httpmech::ResponseSummary& res) {
+        std::printf("%-6s %-16s -> %u  %zu B  %lld ms\n",
+                    std::string{req.method_text}.c_str(), std::string{req.path}.c_str(),
+                    res.status, res.body_bytes,
+                    static_cast<long long>(res.elapsed.count()));
+    });
 
-ws.on_open = [](httpmech::WebSocketSession& s) {
-    s.send_text(R"({"hello":"world"})");
-};
+    httpmech::ServerConfig cfg;
+    cfg.local           = {"127.0.0.1", 8080};   // 0 也行，start() 后用 local() 取真实端口
+    cfg.trusted_proxies = {"127.0.0.1"};         // 采信 nginx 的 X-Real-IP
 
-ws.on_message = [](httpmech::WebSocketSession& s,
-                   httpmech::span<const std::uint8_t> data, bool is_text) {
-    if (is_text) {
-        s.send_text(std::string_view{reinterpret_cast<const char*>(data.data()), data.size()});
+    auto mech = netmech::Mechanism::create();
+    auto srv  = httpmech::HttpServer::create(mech, cfg, router);
+    if (auto ec = srv->start()) {
+        std::fprintf(stderr, "start 失败: %s\n", ec.message().c_str());
+        return 1;
     }
-};
 
-ws.on_close = [](httpmech::WebSocketSession&, std::uint16_t code, std::string_view) {
-    log("ws closed: %u", code);
-};
-
-router->websocket("/ws/events", std::move(ws));   // 握手由库完成
-```
-
-### 解析器（单独用）
-
-```cpp
-httpmech::Parser p{httpmech::Parser::Role::server};
-std::error_code ec;
-auto r = p.feed(httpmech::span{buf, n}, ec);      // 可任意切块喂，包括 1 字节
-if (r == httpmech::Parser::Result::message) {
-    use(p.request());                             // 视图，回调返回即失效
-    p.reset();                                    // 准备下一条（keep-alive）
+    while (srv->running()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    srv->stop();
+    netmech::shutdown();
 }
+```
+
+跑起来：
+
+```bash
+cmake --build build --target hello_server
+./build/bin/hello_server 8080
+
+curl -i http://127.0.0.1:8080/api/status -H 'Authorization: x'
+curl -i -X POST --data 'hello' http://127.0.0.1:8080/api/echo -H 'Authorization: x'
+wscat -c ws://127.0.0.1:8080/ws/echo        # WebSocket 回显
+```
+
+### 只想要 HTTP、不要路由表
+
+`Router` 只是一个现成的 `RequestHandler` 实现。要自己接管所有请求，
+直接实现接口并交给 `HttpServer::create()`：
+
+```cpp
+class MyHandler : public httpmech::RequestHandler {
+public:
+    void on_request(httpmech::HttpRequest& req, httpmech::ResponseWriter& out) override
+    {
+        out.set_content_type("text/plain");
+        out.write("hello");
+        out.end();
+    }
+};
+
+auto srv = httpmech::HttpServer::create(mech, cfg, std::make_shared<MyHandler>());
+```
+
+### 大 body：流式收
+
+默认是聚合模式（`max_body_bytes` 以内一次给完整 body）。要收上传/大报文，
+切到流式模式，body 会被分块喂过来，不占内存：
+
+```cpp
+httpmech::ServerConfig cfg;
+cfg.body_mode = httpmech::Parser::BodyMode::stream;
+
+class UploadHandler : public httpmech::RequestHandler {
+public:
+    void on_request(httpmech::HttpRequest&, httpmech::ResponseWriter&) override {}   // 流式下不调用
+
+    bool on_headers(httpmech::HttpRequest& req, httpmech::ResponseWriter& out) override
+    {
+        if (req.content_length().value_or(0) > 512ull * 1024 * 1024) {
+            out.end_status(httpmech::Status::payload_too_large, "too big");
+            return false;                       // 拒收，省带宽
+        }
+        return true;
+    }
+
+    void on_body_data(httpmech::HttpRequest&, httpmech::span<const std::uint8_t> data) override
+    {
+        // 落盘 / 算摘要 / 转发。data 只在本次回调内有效。
+    }
+
+    void on_body_end(httpmech::HttpRequest&, httpmech::ResponseWriter& out) override
+    {
+        out.end_status(httpmech::Status::ok, "stored");
+    }
+};
 ```
 
 ---
@@ -129,12 +199,33 @@ if (r == httpmech::Parser::Result::message) {
 
 ---
 
+## ⚠️ 底层 `Mechanism` 必须关闭 `linger_zero`
+
+`netmech::Mechanism::Config::linger_zero = true` 会把 socket 的 `SO_LINGER`
+设成 `{1, 0}`：**`close()` 立刻发 RST，丢掉还没进内核的数据**。
+
+HTTP 的 `Connection: close` 恰恰是"写完响应立刻关"，于是最后一包被丢 ——
+客户端拿不到响应，服务端也没有任何错误信号，只能抓包才能发现。
+
+- netmech 的默认值是 `false`（正常四次挥手，数据保证送达），**保持默认即可**。
+- httpmech 在 `start()` 里会检查：发现 `linger_zero == true` 直接返回
+  `Errc::linger_zero_enabled`，错误信息里写了怎么改。
+- 若某个进程里 Modbus 确实需要 `linger_zero = true`，请**给它单独的
+  `Mechanism`**；实在要让 HTTP 共用，把 `ServerConfig::allow_linger_zero`
+  置 true 并自行承担丢应答的风险。
+
+端到端测试 `connection close` 专门验证这条：8 KiB 应答完整送达并以 FIN
+（`recv() == 0`）收尾，而不是 RST。
+
+---
+
 ## 构建
 
 ```bash
 # netmech 放在同级目录（../netmech），或用 -DHTTPMECH_NETMECH_DIR=<路径>
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
+ctest --test-dir build --output-on-failure     # 或直接 ./build/bin/httpmech_ut
 ```
 
 交叉编译 aarch64：
@@ -148,13 +239,23 @@ cmake -S . -B build-aarch64 \
 ## 安装与在别的项目里使用
 
 ```bash
-cmake --install ../netmech/build     # 先装依赖（本仓按家族约定只装自己）
-cmake --install build                # 默认前缀：Linux /usr/local、Windows C:/Program Files/httpmech
+cmake --install ../netmech/build      # 先装依赖（本仓按家族约定只装自己）
+cmake --install build                 # 默认前缀：Linux /usr/local、Windows C:/Program Files/httpmech
 ```
 
 ```cmake
 find_package(httpmech REQUIRED)
 target_link_libraries(app PRIVATE httpmech::httpmech)
+```
+
+装出来的结构：
+
+```
+<prefix>/include/httpmech/*.hpp
+<prefix>/include/httpmech/thirdparty/picohttpparser.h
+<prefix>/lib/libhttpmech.a  libpicohttpparser.a
+<prefix>/lib/cmake/httpmech/httpmech{Config,ConfigVersion,Targets}.cmake
+<prefix>/share/doc/httpmech/LICENSE
 ```
 
 ---
@@ -163,7 +264,7 @@ target_link_libraries(app PRIVATE httpmech::httpmech)
 
 ```
 httpmech/
-├── include/httpmech/      对外头文件（当前唯一有内容的部分）
+├── include/httpmech/      对外头文件
 │   ├── httpmech.hpp       汇总
 │   ├── common.hpp         Method / Status / Limits / Errc
 │   ├── span.hpp           只读 span
@@ -174,16 +275,15 @@ httpmech/
 │   ├── server.hpp         HttpServer / ResponseWriter / RequestHandler
 │   ├── router.hpp         Router：精确路由 + before/after
 │   └── client.hpp         【v0.2 预留，不实现】
-├── docs/design.md         概要设计（含与 wtoe::HttpProtocol 的对照）
-├── cmake/                 包配置模板
-├── thirdparty/            picohttpparser（MIT，vendored）
-├── src/                   （待实现：parser / server / ws 帧层 / sha1-base64）
-├── test/                  （待实现）
-└── example/               （待实现）
+├── src/                   实现（parser / server / router / websocket / sha1+base64）
+├── test/                  单元测试 + 端到端测试
+├── example/hello_server.cpp
+├── docs/design.md         概要设计
+└── thirdparty/            picohttpparser（MIT，vendored）
 ```
 
 ## 依赖与许可
 
-- 传输：[netmech](../netmech)（自带 Asio，无需安装 Boost）
+- 传输：[netmech](https://github.com/goldhalo/netmech)（自带 Asio，无需安装 Boost）
 - 解析：[picohttpparser](https://github.com/h2o/picohttpparser)（MIT，已 vendored）
 - 本库：MIT，见 [LICENSE](LICENSE)

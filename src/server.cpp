@@ -761,6 +761,12 @@ std::error_code HttpServer::start()
         return make_error_code(Errc::not_started);
     }
 
+    // SO_LINGER{1,0} 会在 close 时发 RST 丢掉最后那一包 —— 对 HTTP 是
+    // 静默丢响应，必须拦在启动阶段（错误信息里写了怎么改）。
+    if (!m_impl->cfg.allow_linger_zero && m_impl->mech->linger_zero()) {
+        return make_error_code(Errc::linger_zero_enabled);
+    }
+
     // running 必须先置 true：AcceptBridge 会用它判断"是否还在服务"
     m_impl->running.store(true);
 

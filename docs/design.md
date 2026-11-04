@@ -185,6 +185,26 @@ nginx 与进程同机时配 `{"127.0.0.1"}`。
 | WS 单消息（跨分片） | 4 MiB |
 | WS 发送队列 | 8 MiB |
 
+### SO_LINGER
+
+底层 `Mechanism` **不能**用 `Config::linger_zero = true`（会把 SO_LINGER 设成
+`{1,0}`，`close()` 直接 RST 丢掉未发数据）。HTTP 的 `Connection: close`
+正是"写完响应立刻关"，最后一包会被静默丢弃。
+
+`HttpServer::start()` 会检查并返回 `Errc::linger_zero_enabled`；
+确实需要 RST 的场景请给 HTTP 单独的 `Mechanism`，或显式置
+`ServerConfig::allow_linger_zero = true` 承担风险。
+
+### SO_LINGER
+
+底层 `Mechanism` **不能**用 `Config::linger_zero = true`（会把 SO_LINGER 设成
+`{1,0}`，`close()` 直接 RST 丢掉未发数据）。HTTP 的 `Connection: close`
+正是"写完响应立刻关"，最后一包会被静默丢弃。
+
+`HttpServer::start()` 会检查并返回 `Errc::linger_zero_enabled`；
+确实需要 RST 的场景请给 HTTP 单独的 `Mechanism`，或显式置
+`ServerConfig::allow_linger_zero = true` 承担风险。
+
 ### 错误处理
 
 | 情况 | 行为 |

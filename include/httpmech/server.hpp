@@ -260,6 +260,17 @@ struct ServerConfig {
     /// WebSocket 参数（`upgrade_websocket()` 未显式给 cfg 时用这份）。
     WebSocketConfig websocket{};
 
+    /// 是否允许底层 Mechanism 启用 `Config::linger_zero`。
+    ///
+    /// **默认不允许**：`linger_zero = true` 会把 socket 的 SO_LINGER 设成
+    /// `{1, 0}`，`close()` 立刻发 RST 并**丢掉还没进内核的数据**。HTTP 的
+    /// `Connection: close` 恰恰是"写完响应立刻关"，于是最后一包被丢，
+    /// 客户端拿不到响应 —— 而且没有任何错误信号，只能靠抓包发现。
+    ///
+    /// @note 不设 SO_LINGER（netmech 的默认）时是正常四次挥手，数据保证送达。
+    ///       确实需要 RST 快速回收端口时把它置 true，并自行承担丢应答的风险。
+    bool allow_linger_zero = false;
+
     /// 受信任的反向代理地址。**只有来自这些地址的连接**，`X-Real-IP` /
     /// `X-Forwarded-*` / `X-AGENT-SSL` 才会被采信，否则视为普通客户端伪造的头。
     ///
