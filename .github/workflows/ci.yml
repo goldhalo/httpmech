@@ -271,7 +271,17 @@ jobs:
           ASAN_OPTIONS: detect_leaks=0:abort_on_error=1:strict_string_checks=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
           LSAN_OPTIONS: detect_leaks=0
-        run: ctest --test-dir build-san --output-on-failure --timeout 300
+        # 失败时把关键行打进 annotation（原始日志要管理员权限才取得到）
+        run: |
+          set +e
+          ctest --test-dir build-san --output-on-failure --timeout 300 2>&1 | tee /tmp/san.log
+          rc=${PIPESTATUS[0]}
+          if [ $rc -ne 0 ]; then
+            line=$(grep -m1 -E "ERROR: AddressSanitizer|runtime error|SEGV|FAIL\]|Timeout" /tmp/san.log | cut -c1-320)
+            [ -z "$line" ] && line=$(tail -5 /tmp/san.log | tr '\n' ' ')
+            echo "::error title=sanitizer 失败::$line"
+            exit 1
+          fi
 
   # ---------------------------------------------------------------------------
   # 质量门禁
