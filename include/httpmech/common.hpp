@@ -189,6 +189,8 @@ enum class Errc {
     headers_sent       = 23,  ///< 已开始发送响应，不能再改状态/头部
     response_incomplete= 24,  ///< 应用没调用 end() 就返回了
     linger_zero_enabled= 25,  ///< 底层 Mechanism 开了 linger_zero，HTTP 响应会丢
+    client_timeout     = 26,  ///< 客户端等响应超时
+    bad_websocket_handshake = 27,  ///< 客户端握手被拒（状态码/头不对）
 };
 
 /// 错误码类别。`std::error_code{e, httpmech::error_category()}`。

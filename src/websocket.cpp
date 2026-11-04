@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <random>
 
 namespace httpmech {
 
@@ -48,21 +49,30 @@ constexpr std::uint8_t kOpPong   = 0xA;
 
 /// 追加一帧（服务端发出的帧**不打掩码**）。
 void append_frame(std::string& out, std::uint8_t opcode, bool fin,
-                  const std::uint8_t* payload, std::size_t len)
+                  const std::uint8_t* payload, std::size_t len,
+                  const std::uint8_t* mask /* nullptr = 不打掩码 */)
 {
     out.push_back(static_cast<char>((fin ? 0x80 : 0x00) | (opcode & 0x0F)));
 
+    const std::uint8_t mask_bit = (mask != nullptr) ? 0x80 : 0x00;
     if (len < 126) {
-        out.push_back(static_cast<char>(len));
+        out.push_back(static_cast<char>(mask_bit | len));
     } else if (len <= 0xFFFF) {
-        out.push_back(static_cast<char>(126));
+        out.push_back(static_cast<char>(mask_bit | 126));
         out.push_back(static_cast<char>((len >> 8) & 0xFF));
         out.push_back(static_cast<char>(len & 0xFF));
     } else {
-        out.push_back(static_cast<char>(127));
+        out.push_back(static_cast<char>(mask_bit | 127));
         for (int i = 7; i >= 0; --i) {
             out.push_back(static_cast<char>((static_cast<std::uint64_t>(len) >> (i * 8)) & 0xFF));
         }
+    }
+    if (mask != nullptr) {
+        out.append(reinterpret_cast<const char*>(mask), 4);
+        for (std::size_t i = 0; i < len; ++i) {
+            out.push_back(static_cast<char>(payload[i] ^ mask[i % 4]));
+        }
+        return;
     }
     if (len != 0) {
         out.append(reinterpret_cast<const char*>(payload), len);
@@ -75,10 +85,11 @@ void append_frame(std::string& out, std::uint8_t opcode, bool fin,
 //  会话
 // =============================================================================
 
-WsSessionImpl::WsSessionImpl(WsIo io, WebSocketConfig cfg, WebSocketHandlers handlers,
+WsSessionImpl::WsSessionImpl(Role role, WsIo io, WebSocketConfig cfg, WebSocketHandlers handlers,
                              std::string path, std::string real_ip, netmech::Address peer,
                              std::string handshake_headers_raw)
-    : m_io(std::move(io))
+    : m_role(role)
+    , m_io(std::move(io))
     , m_cfg(std::move(cfg))
     , m_handlers(std::move(handlers))
     , m_path(std::move(path))
@@ -88,6 +99,12 @@ WsSessionImpl::WsSessionImpl(WsIo io, WebSocketConfig cfg, WebSocketHandlers han
 {
     m_last_rx   = std::chrono::steady_clock::now();
     m_last_ping = m_last_rx;
+
+    // 掩码用的种子：同一进程里的多个连接不该共用同一串掩码。
+    // 这里只求"不重复"，不追求密码学强度（RFC 只要求不可预测到防止
+    // 中间层做缓存投毒，对设备内网场景足够）。
+    std::random_device rd;
+    m_rng = (static_cast<std::uint32_t>(rd()) ^ 0x9E3779B9u) | 1u;
 }
 
 void WsSessionImpl::start()
@@ -130,8 +147,22 @@ bool WsSessionImpl::send_frame(std::uint8_t opcode, bool fin, span<const std::ui
         return false;
     }
     std::string wire;
-    wire.reserve(payload.size() + 10);
-    append_frame(wire, opcode, fin, payload.data(), payload.size());
+    wire.reserve(payload.size() + 14);
+
+    std::uint8_t mask[4] = {0, 0, 0, 0};
+    if (m_role == Role::client) {
+        // xorshift：够用且无依赖
+        m_rng ^= m_rng << 13;
+        m_rng ^= m_rng >> 17;
+        m_rng ^= m_rng << 5;
+        const std::uint32_t k = m_rng;
+        mask[0] = static_cast<std::uint8_t>((k >> 24) & 0xFF);
+        mask[1] = static_cast<std::uint8_t>((k >> 16) & 0xFF);
+        mask[2] = static_cast<std::uint8_t>((k >> 8) & 0xFF);
+        mask[3] = static_cast<std::uint8_t>(k & 0xFF);
+    }
+    append_frame(wire, opcode, fin, payload.data(), payload.size(),
+                 (m_role == Role::client) ? mask : nullptr);
 
     m_pending_out += wire.size();
     const bool ok = m_io.send ? m_io.send(std::move(wire), close_after) : false;
@@ -242,8 +273,8 @@ void WsSessionImpl::feed_one_frame(std::error_code& ec)
         ec = make_error_code(Errc::bad_chunk);   // 没有协商任何扩展，RSV 必须为 0
         return;
     }
-    if (!masked) {
-        // 客户端→服务端必须打掩码
+    // 掩码规则两端相反：服务端收到的必须带，客户端收到的必须不带。
+    if (m_role == Role::server ? !masked : masked) {
         ec = make_error_code(Errc::bad_chunk);
         return;
     }
@@ -278,17 +309,22 @@ void WsSessionImpl::feed_one_frame(std::error_code& ec)
         return;
     }
 
-    if (n < off + 4 + static_cast<std::size_t>(len)) {
+    // 只有带掩码的帧才有那 4 字节 key。客户端收到的帧按 RFC 是**不带**的，
+    // 早期版本无条件跳 4 字节，结果把 payload 的前 4 字节当掩码吃掉。
+    const std::size_t key_len = masked ? 4u : 0u;
+    if (n < off + key_len + static_cast<std::size_t>(len)) {
         return;   // 帧还没到齐
     }
 
-    const std::uint8_t* mask = p + off;
-    off += 4;
+    const std::uint8_t* mask    = masked ? (p + off) : nullptr;
+    off += key_len;
     const std::uint8_t* payload = p + off;
 
     std::string data(reinterpret_cast<const char*>(payload), static_cast<std::size_t>(len));
-    for (std::size_t i = 0; i < data.size(); ++i) {
-        data[i] = static_cast<char>(static_cast<std::uint8_t>(data[i]) ^ mask[i % 4]);
+    if (mask != nullptr) {
+        for (std::size_t i = 0; i < data.size(); ++i) {
+            data[i] = static_cast<char>(static_cast<std::uint8_t>(data[i]) ^ mask[i % 4]);
+        }
     }
 
     m_in.erase(0, off + static_cast<std::size_t>(len));

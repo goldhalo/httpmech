@@ -1,16 +1,15 @@
 // =============================================================================
-//  httpmech - 客户端【v0.2 预留，v0.1 不实现】
+//  httpmech - 客户端（HTTP 与 WebSocket）
 // =============================================================================
 //  文件    : httpmech/client.hpp
 //  用途    : HttpClient —— 一条到目标地址的连接，串行发请求、收响应。
 //  依赖    : netmech（Mechanism / Linkable / Conn）+ 本库 parser。
 //  编码    : UTF-8
 //
-//  ★ 状态：不是 v0.1 的交付范围
-//    部署形态是"nginx 在前面终结 TLS"，服务端是必须的；客户端只在设备主动
-//    往外部平台拉/推的场景才需要，暂时用不上。头文件先放着，是为了让
-//    `HttpClient` / `WebSocketClient` 的形状跟服务端一起评审，避免以后推翻。
-//    **v0.1 不写实现**，接口评审通过后按 v0.2 排期。
+//  ★ 状态：v0.2 已实现
+//    服务端是 v0.1 的必需项；客户端用于设备主动往平台拉/推的场景
+//    （上报 JSON、订阅 WS 推送）。与 ServiceConfig 一样，客户端也不做 TLS ——
+//    需要 HTTPS 的走 nginx 或由应用自己加一层。
 //
 //  ★ 为什么是"一条连接 + 串行队列"，不是连接池
 //    通信管理机里的 HTTP 出站基本是"往平台上报一包 JSON"，QPS 个位数。
@@ -41,6 +40,7 @@
 #include <httpmech/message.hpp>
 #include <httpmech/parser.hpp>
 #include <httpmech/span.hpp>
+#include <httpmech/websocket.hpp>
 
 namespace httpmech {
 
@@ -147,6 +147,8 @@ struct ClientConfig {
 /// 同一时刻**只有一个请求在途**，其余按提交顺序排队。
 class HttpClient : public std::enable_shared_from_this<HttpClient> {
 public:
+    struct Impl;   ///< 内部实现（不透明，定义在 src/client.cpp）
+
     /// 创建（不连接）。首次 `request()` 时自动连接。
     static std::shared_ptr<HttpClient> create(std::shared_ptr<netmech::Mechanism> mech,
                                               ClientConfig                       cfg);
@@ -174,6 +176,104 @@ public:
 
     [[nodiscard]] std::uint64_t requests_total() const noexcept;
     [[nodiscard]] std::uint64_t failures_total() const noexcept;
+
+private:
+    HttpClient();
+
+    std::shared_ptr<Impl> m_impl;
+};
+
+// =============================================================================
+//  WebSocket 客户端
+// =============================================================================
+
+struct WebSocketClientConfig {
+    /// 服务端地址（含端口）。
+    netmech::Address remote{"127.0.0.1", 80};
+
+    /// 握手请求的路径（含 query），例如 `"/ws/events?token=abc"`。
+    std::string path{"/"};
+
+    /// 写进 `Host:`。空 = 由 `remote` 生成（端口 80 时省略端口）。
+    std::string host;
+
+    /// 额外请求头：`Cookie` / `Authorization` / `Sec-WebSocket-Protocol` 等。
+    /// `Upgrade` / `Connection` / `Sec-WebSocket-Key` / `Sec-WebSocket-Version`
+    /// 由库生成，这里写了也会被覆盖。
+    Headers headers;
+
+    std::string user_agent = "httpmech";
+
+    std::chrono::milliseconds connect_timeout{3'000};
+    std::chrono::milliseconds handshake_timeout{5'000};
+
+    WebSocketConfig ws{};
+};
+
+/// 客户端侧的回调。
+///
+/// 与服务端的 `WebSocketHandlers` 分开，是因为客户端多了一个"连不上/握手被拒"
+/// 的阶段 —— 那时还没有 session 对象，`on_close` 没法表达。
+struct WebSocketClientHandlers {
+    std::function<void(WebSocketSession&)>                                       on_open;
+    std::function<void(WebSocketSession&, span<const std::uint8_t>, bool)>       on_message;
+    std::function<void(WebSocketSession&, std::uint16_t, std::string_view)>      on_close;
+
+    /// 连接失败或握手被拒（此时**不会**有 `on_open` / `on_close`）。
+    std::function<void(std::error_code)> on_error;
+};
+
+/// WebSocket 客户端（主动连接、发/收帧）。
+///
+/// @par 用法
+/// @code
+/// httpmech::WebSocketClientConfig cfg;
+/// cfg.remote = {"192.168.3.10", 8080};
+/// cfg.path   = "/ws/events";
+///
+/// auto cli = httpmech::WebSocketClient::create(mech, cfg);
+///
+/// httpmech::WebSocketClientHandlers h;
+/// h.on_open    = [](httpmech::WebSocketSession& s) { s.send_text("hi"); };
+/// h.on_message = [](httpmech::WebSocketSession& s, httpmech::span<const std::uint8_t> d, bool text) {
+///     // ...
+/// };
+/// h.on_close   = [](httpmech::WebSocketSession&, std::uint16_t code, std::string_view) {};
+/// h.on_error   = [](std::error_code ec) { fprintf(stderr, "%s\n", ec.message().c_str()); };
+///
+/// cli->connect(std::move(h));      // 异步：结果走回调
+/// @endcode
+///
+/// @par 重连
+/// **不自动重连**。掉线后 `on_close` / `on_error` 会来一次，要不要重连、隔多久
+/// 重连由应用决定（设备侧通常要退避）。库只提供一次干净的状态复位。
+class WebSocketClient : public std::enable_shared_from_this<WebSocketClient> {
+public:
+    struct Impl;   ///< 内部实现（不透明，定义在 src/client.cpp）
+
+    static std::shared_ptr<WebSocketClient> create(std::shared_ptr<netmech::Mechanism> mech,
+                                                   WebSocketClientConfig              cfg);
+
+    ~WebSocketClient();
+
+    WebSocketClient(const WebSocketClient&)            = delete;
+    WebSocketClient& operator=(const WebSocketClient&) = delete;
+
+    /// 发起连接（异步）。已连接或连接中时返回 false。
+    bool connect(WebSocketClientHandlers handlers);
+
+    /// 主动关闭（发 close 帧，等对端回应或 2 秒超时）。幂等。
+    void close(std::uint16_t code = static_cast<std::uint16_t>(WsCloseCode::normal),
+               std::string_view reason = {});
+
+    [[nodiscard]] bool          connecting() const noexcept;
+    [[nodiscard]] bool          is_open() const noexcept;
+    [[nodiscard]] std::uint64_t messages_received() const noexcept;
+
+private:
+    WebSocketClient();
+
+    std::shared_ptr<Impl> m_impl;
 };
 
 } // namespace httpmech

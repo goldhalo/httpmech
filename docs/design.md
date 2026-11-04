@@ -285,7 +285,7 @@ nginx 与进程同机时配 `{"127.0.0.1"}`。
 | `server` | ✅ | netmech 接线、keep-alive、超时清理、协议错误响应、`real_ip()` 白名单 |
 | `router` | ✅ | 精确路由 + before/after + 405/Allow |
 | `websocket` | ✅ | 握手（SHA-1 + Base64 自带）、帧层、分片、ping/pong、close 握手、空闲与 ping 定时 |
-| `client` | ⏳ | v0.2 |
+| `client` | ✅ | HttpClient（串行队列 / keep-alive / chunked）+ WebSocketClient（掩码发起 + 握手校验） |
 
 ### 与设计稿的偏差（实现时发现，已在代码注释里标出）
 

@@ -29,7 +29,14 @@ struct WsIo {
 class WsSessionImpl : public WebSocketSession,
                       public std::enable_shared_from_this<WsSessionImpl> {
 public:
-    WsSessionImpl(WsIo                        io,
+    /// 两端在掩码上是不对称的（RFC 6455 §5.1）：
+    ///   客户端 → 服务端：**必须**打掩码
+    ///   服务端 → 客户端：**必须不打**掩码
+    /// 所以同一个帧层要按角色决定"收的时候要不要求掩码、发的时候打不打"。
+    enum class Role : std::uint8_t { server, client };
+
+    WsSessionImpl(Role                        role,
+                  WsIo                        io,
                   WebSocketConfig             cfg,
                   WebSocketHandlers           handlers,
                   std::string                 path,
@@ -77,6 +84,7 @@ private:
                            bool close_after = false);
     void        protocol_error(std::uint16_t code, std::string_view why);
 
+    Role                               m_role;
     WsIo                               m_io;
     WebSocketConfig                    m_cfg;
     WebSocketHandlers                  m_handlers;
@@ -94,6 +102,8 @@ private:
     bool                 m_close_sent = false;
     std::size_t          m_pending_out = 0;
     std::uint64_t        m_recv_msgs = 0;
+
+    std::uint32_t                      m_rng = 0x9E3779B9u;   ///< 客户端掩码用的 PRNG
 
     std::chrono::steady_clock::time_point m_last_rx;
     std::chrono::steady_clock::time_point m_last_ping;

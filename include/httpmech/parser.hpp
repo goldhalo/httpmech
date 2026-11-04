@@ -128,6 +128,13 @@ public:
     ///       下一次 `next()` 会直接开始解析它，不需要重新 feed。
     void reset() noexcept;
 
+    /// 缓冲里未被消费的字节（只读视图，下一次 feed / reset 前有效）。
+    ///
+    /// 用途：客户端收到 `101 Switching Protocols` 之后，对端可能已经
+    /// 把第一批 WS 帧紧跟在响应头后面发过来了 —— 那些字节还在解析器缓冲里，
+    /// 必须原样交给帧层，否则会丢帧。
+    [[nodiscard]] span<const std::uint8_t> pending_bytes() const noexcept;
+
     /// 缓冲里还有多少未被消费的字节。
     /// 典型用途：`while (p.pending() > 0) { p.reset(); p.next(ec); ... }`
     [[nodiscard]] std::size_t pending() const noexcept;

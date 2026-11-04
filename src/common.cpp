@@ -195,6 +195,8 @@ public:
         case Errc::not_connected:             return "not connected";
         case Errc::headers_sent:              return "headers already sent";
         case Errc::response_incomplete:       return "handler returned without ending the response";
+        case Errc::client_timeout:            return "response timeout";
+        case Errc::bad_websocket_handshake:   return "websocket handshake rejected";
         case Errc::linger_zero_enabled:
             return "Mechanism was created with linger_zero=true: SO_LINGER{1,0} sends RST on close "
                    "and would drop the last response. Create the Mechanism with "

@@ -622,6 +622,13 @@ void Parser::reset() noexcept
     d.failed    = false;
 }
 
+span<const std::uint8_t> Parser::pending_bytes() const noexcept
+{
+    const Impl& d = *m_impl;
+    return span<const std::uint8_t>{
+        reinterpret_cast<const std::uint8_t*>(d.buf.data() + d.begin), d.avail()};
+}
+
 std::size_t Parser::pending() const noexcept
 {
     return m_impl->avail();

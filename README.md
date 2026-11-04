@@ -12,7 +12,7 @@ TLS、HTTP/2、静态文件都交给前面的 nginx，本库只处理它转过�
 
 - 自带路由、before/after 钩子、WebSocket（握手 + 帧层），**零外部依赖**
 - C++17，不引 Boost / OpenSSL；WebSocket 握手用的 SHA-1 + Base64 也是自带的
-- 172 个断言（单元 + 端到端），CI 覆盖 Linux（gcc/clang × Debug/Release）与 Windows MSVC
+- 212 个断言（单元 + 端到端），CI 覆盖 Linux（gcc/clang × Debug/Release）与 Windows MSVC
 
 ---
 
@@ -23,8 +23,10 @@ TLS、HTTP/2、静态文件都交给前面的 nginx，本库只处理它转过�
 | HTTP/1.1 解析与序列化、chunked 请求体 | TLS / HTTPS（nginx 终结） |
 | 路由（精确匹配）+ before/after 钩子 | HTTP/2、gRPC |
 | WebSocket（握手、帧层、分片、ping/pong、close） | 业务纤程 / 线程池 |
-| keep-alive、流式 body、资源上限 | HTTP / WebSocket 客户端（v0.2） |
+| keep-alive、流式 body、资源上限 | 连接池 / 自动重连 / 重定向跟随 |
 | `X-Real-IP` / `X-AGENT-SSL` 代理头识别（白名单） | 静态文件、gzip、multipart |
+| **客户端**：HttpClient（串行队列）/ WebSocketClient | 连接池、自动重连、cookie 罐 |
+| **客户端**：HttpClient（串行队列）/ WebSocketClient | 连接池、自动重连、cookie 罐 |
 
 设计取舍见 **[docs/design.md](docs/design.md)**（含与 wtoe::HttpProtocol 的对照）。
 
@@ -182,6 +184,123 @@ public:
     }
 };
 ```
+
+### 客户端
+
+```cpp
+// ---- HTTP ----
+httpmech::ClientConfig ccfg;
+ccfg.remote = {"192.168.3.10", 9898};
+
+auto cli = httpmech::HttpClient::create(mech, ccfg);
+
+class MyHandler : public httpmech::ResponseHandler {
+public:
+    void on_response(const httpmech::HttpResponse& resp) override
+    {
+        // resp.body 在聚合模式下是完整的；视图只在回调内有效
+        std::printf("status=%u body=%zu\n", resp.status_code, resp.body.size());
+    }
+    void on_complete(std::error_code ec) override
+    {
+        if (ec) { std::fprintf(stderr, "%s\n", ec.message().c_str()); }
+    }
+};
+
+httpmech::RequestSpec spec;
+spec.method = httpmech::Method::post;
+spec.target = "/api/v1/report";
+spec.headers.set("Content-Type", "application/json");
+spec.body   = R"({"dev":"m1","p":123.4})";
+cli->request(std::move(spec), std::make_shared<MyHandler>());   // 串行队列
+```
+
+```cpp
+// ---- WebSocket ----
+httpmech::WebSocketClientConfig wcfg;
+wcfg.remote = {"192.168.3.10", 8080};
+wcfg.path   = "/ws/events";
+
+auto ws = httpmech::WebSocketClient::create(mech, wcfg);
+
+httpmech::WebSocketClientHandlers h;
+h.on_open    = [](httpmech::WebSocketSession& s) { s.send_text("hi"); };
+h.on_message = [](httpmech::WebSocketSession&, httpmech::span<const std::uint8_t> d, bool) {
+    // 收到一条完整消息（已解掩码、已重组分片）
+};
+h.on_close   = [](httpmech::WebSocketSession&, std::uint16_t code, std::string_view) {};
+h.on_error   = [](std::error_code ec) { std::fprintf(stderr, "%s\n", ec.message().c_str()); };
+
+ws->connect(std::move(h));      // 异步：结果走回调
+```
+
+客户端的两条约定：
+
+- **一条连接 + 串行队列**，不是连接池。同一时刻只有一笔请求在途，其余排队；
+  需要并发就建多个 `HttpClient`。
+- **不自动重连**。掉线后 `on_close` / `on_error` 各来一次，退避策略由应用决定。
+- HTTP 的 `4xx/5xx` 交给应用（`on_response` 里的 `status_code`），**不**当成
+  `ec`；`ec` 只表示"没拿到响应"（连不上、超时、协议错误）。
+
+### 客户端
+
+```cpp
+// ---- HTTP ----
+httpmech::ClientConfig ccfg;
+ccfg.remote = {"192.168.3.10", 9898};
+
+auto cli = httpmech::HttpClient::create(mech, ccfg);
+
+class MyHandler : public httpmech::ResponseHandler {
+public:
+    void on_response(const httpmech::HttpResponse& resp) override
+    {
+        // resp.body 在聚合模式下是完整的；视图只在回调内有效
+        std::printf("status=%u body=%zu
+", resp.status_code, resp.body.size());
+    }
+    void on_complete(std::error_code ec) override
+    {
+        if (ec) { std::fprintf(stderr, "%s
+", ec.message().c_str()); }
+    }
+};
+
+httpmech::RequestSpec spec;
+spec.method = httpmech::Method::post;
+spec.target = "/api/v1/report";
+spec.headers.set("Content-Type", "application/json");
+spec.body   = R"({"dev":"m1","p":123.4})";
+cli->request(std::move(spec), std::make_shared<MyHandler>());   // 串行队列
+```
+
+```cpp
+// ---- WebSocket ----
+httpmech::WebSocketClientConfig wcfg;
+wcfg.remote = {"192.168.3.10", 8080};
+wcfg.path   = "/ws/events";
+
+auto ws = httpmech::WebSocketClient::create(mech, wcfg);
+
+httpmech::WebSocketClientHandlers h;
+h.on_open    = [](httpmech::WebSocketSession& s) { s.send_text("hi"); };
+h.on_message = [](httpmech::WebSocketSession&, httpmech::span<const std::uint8_t> d, bool) {
+    // 收到一条完整消息（已解掩码、已重组分片）
+};
+h.on_close   = [](httpmech::WebSocketSession&, std::uint16_t code, std::string_view) {};
+h.on_error   = [](std::error_code ec) { std::fprintf(stderr, "%s
+", ec.message().c_str()); };
+
+ws->connect(std::move(h));      // 异步：结果走回调
+```
+
+客户端的两条约定：
+
+- **一条连接 + 串行队列**，不是连接池。同一时刻只有一笔请求在途，其余排队；
+  需要并发就建多个 `HttpClient`。
+- **不自动重连**。掉线后 `on_close` / `on_error` 各来一次，退避策略由应用决定。
+- HTTP 的 `4xx/5xx` 交给应用（`on_response` 里的 `status_code`），**不**当成
+  `ec`；`ec` 只表示"没拿到响应"（连不上、超时、协议错误）。
 
 ---
 

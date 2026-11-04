@@ -3,9 +3,13 @@
 // =============================================================================
 #include <httpmech/httpmech.hpp>
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <future>
+#include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -563,6 +567,269 @@ void test_linger_zero_guard()
     srv2->stop();
 }
 
+// =============================================================================
+//  客户端
+// =============================================================================
+
+/// 同步等待帮手：回调在 io 线程，测试线程在这里等。
+struct Waiter {
+    std::mutex              mu;
+    std::condition_variable cv;
+    bool                    done = false;
+
+    void signal()
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        done = true;
+        cv.notify_all();
+    }
+    bool wait(int ms = 5000)
+    {
+        std::unique_lock<std::mutex> lk(mu);
+        return cv.wait_for(lk, std::chrono::milliseconds(ms), [this] { return done; });
+    }
+};
+
+/// 只收整条的处理器
+class SyncHandler : public httpmech::ResponseHandler {
+public:
+    explicit SyncHandler(std::shared_ptr<Waiter> w) : waiter(std::move(w)) {}
+
+    void on_response(const httpmech::HttpResponse& resp) override
+    {
+        status = resp.status_code;
+        body.assign(reinterpret_cast<const char*>(resp.body.data()), resp.body.size());
+    }
+    void on_complete(std::error_code e) override
+    {
+        ec = e;
+        waiter->signal();
+    }
+
+    std::shared_ptr<Waiter> waiter;
+    std::string             body;
+    std::uint16_t           status = 0;
+    std::error_code         ec;
+};
+
+void test_http_client_e2e()
+{
+    g_case = "http client e2e";
+
+    // --- 起一个真服务端 ---
+    httpmech::ServerConfig cfg;
+    cfg.local     = {"127.0.0.1", 0};
+    cfg.emit_date = false;
+
+    auto router = std::make_shared<httpmech::Router>();
+    router->get("/api/status", [](const httpmech::HttpRequest&,
+                                  httpmech::ResponseWriter& out) {
+        out.set_content_type("application/json");
+        out.write(R"({"ok":true})");
+        out.end();
+    });
+    router->post("/api/echo", [](const httpmech::HttpRequest& req,
+                                 httpmech::ResponseWriter& out) {
+        out.write(req.body);
+        out.end();
+    });
+
+    auto srv_mech = netmech::Mechanism::create();
+    auto srv      = httpmech::HttpServer::create(srv_mech, cfg, router);
+    REQUIRE(srv != nullptr);
+    REQUIRE(!srv->start());
+
+    // --- 客户端连过去 ---
+    httpmech::ClientConfig ccfg;
+    ccfg.remote = {"127.0.0.1", srv->local().port()};
+    auto cli    = httpmech::HttpClient::create(netmech::Mechanism::create(), ccfg);
+    REQUIRE(cli != nullptr);
+
+    // 1) GET
+    {
+        auto w = std::make_shared<Waiter>();
+        auto h = std::make_shared<SyncHandler>(w);
+        httpmech::RequestSpec spec;
+        spec.target = "/api/status";
+        REQUIRE(cli->request(std::move(spec), h));
+        CHECK(w->wait());
+        CHECK(!h->ec);
+        CHECK_EQ(static_cast<int>(h->status), 200);
+        CHECK_EQ(h->body, std::string{R"({"ok":true})"});
+    }
+
+    // 2) POST（同一条连接复用）
+    {
+        auto w = std::make_shared<Waiter>();
+        auto h = std::make_shared<SyncHandler>(w);
+        httpmech::RequestSpec spec;
+        spec.method = httpmech::Method::post;
+        spec.target = "/api/echo";
+        spec.body   = "hello-client";
+        REQUIRE(cli->request(std::move(spec), h));
+        CHECK(w->wait());
+        CHECK(!h->ec);
+        CHECK_EQ(h->body, std::string{"hello-client"});
+    }
+
+    // 3) 404 也要原样交给应用（不当作错误）
+    {
+        auto w = std::make_shared<Waiter>();
+        auto h = std::make_shared<SyncHandler>(w);
+        httpmech::RequestSpec spec;
+        spec.target = "/nope";
+        REQUIRE(cli->request(std::move(spec), h));
+        CHECK(w->wait());
+        CHECK(!h->ec);
+        CHECK_EQ(static_cast<int>(h->status), 404);
+    }
+
+    CHECK(cli->requests_total() >= 3);
+    CHECK_EQ(cli->failures_total(), std::uint64_t{0});
+
+    cli->close();
+    srv->stop();
+}
+
+// -----------------------------------------------------------------------------
+//  chunked 响应：用一个"假服务端"直接往 socket 里写手写报文。
+//  我们自己的服务端只会发 Content-Length，chunked 解码路径只能这样测。
+// -----------------------------------------------------------------------------
+void test_http_client_chunked()
+{
+    g_case = "http client chunked";
+
+    const int lfd = ::socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(lfd >= 0);
+    int one = 1;
+    ::setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(0);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    REQUIRE(::bind(lfd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+    REQUIRE(::listen(lfd, 4) == 0);
+
+    socklen_t alen = sizeof(addr);
+    REQUIRE(::getsockname(lfd, reinterpret_cast<sockaddr*>(&addr), &alen) == 0);
+    const std::uint16_t port = ntohs(addr.sin_port);
+
+    std::thread fake([lfd] {
+        const int c = ::accept(lfd, nullptr, nullptr);
+        if (c < 0) {
+            return;
+        }
+        char buf[1024];
+        (void)::recv(c, buf, sizeof(buf), 0);   // 请求内容不关心
+        const std::string resp =
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+            "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+        (void)::send(c, resp.data(), resp.size(), 0);
+        ::shutdown(c, SHUT_WR);
+        ::close(c);
+    });
+
+    httpmech::ClientConfig ccfg;
+    ccfg.remote = {"127.0.0.1", port};
+    auto cli    = httpmech::HttpClient::create(netmech::Mechanism::create(), ccfg);
+    REQUIRE(cli != nullptr);
+
+    auto w = std::make_shared<Waiter>();
+    auto h = std::make_shared<SyncHandler>(w);
+    httpmech::RequestSpec spec;
+    spec.target = "/x";
+    REQUIRE(cli->request(std::move(spec), h));
+    CHECK(w->wait());
+    CHECK(!h->ec);
+    CHECK_EQ(static_cast<int>(h->status), 200);
+    CHECK_EQ(h->body, std::string{"Wikipedia"});
+
+    cli->close();
+    fake.join();
+    ::close(lfd);
+}
+
+void test_websocket_client_e2e()
+{
+    g_case = "websocket client e2e";
+
+    // 服务端：/ws 回显
+    httpmech::ServerConfig cfg;
+    cfg.local     = {"127.0.0.1", 0};
+    cfg.emit_date = false;
+
+    auto router = std::make_shared<httpmech::Router>();
+    httpmech::WebSocketHandlers ws;
+    ws.on_open = [](httpmech::WebSocketSession& s) { s.send_text("server-hello"); };
+    ws.on_message = [](httpmech::WebSocketSession& s,
+                       httpmech::span<const std::uint8_t> d, bool text) {
+        if (text) {
+            s.send_text(std::string_view{reinterpret_cast<const char*>(d.data()), d.size()});
+        } else {
+            s.send_binary(d);
+        }
+    };
+    router->websocket("/ws", std::move(ws));
+
+    auto srv_mech = netmech::Mechanism::create();
+    auto srv      = httpmech::HttpServer::create(srv_mech, cfg, router);
+    REQUIRE(srv != nullptr);
+    REQUIRE(!srv->start());
+
+    // 客户端
+    httpmech::WebSocketClientConfig wcfg;
+    wcfg.remote = {"127.0.0.1", srv->local().port()};
+    wcfg.path   = "/ws";
+    auto cli    = httpmech::WebSocketClient::create(netmech::Mechanism::create(), wcfg);
+    REQUIRE(cli != nullptr);
+
+    auto wait_open  = std::make_shared<Waiter>();
+    auto wait_first = std::make_shared<Waiter>();
+    auto wait_echo  = std::make_shared<Waiter>();
+    std::string first_msg;
+    std::string echo_msg;
+    std::error_code conn_ec;
+
+    httpmech::WebSocketClientHandlers h;
+    h.on_open = [&](httpmech::WebSocketSession& s) {
+        wait_open->signal();
+        s.send_text("client-hi");
+    };
+    h.on_message = [&](httpmech::WebSocketSession&, httpmech::span<const std::uint8_t> d,
+                       bool /*text*/) {
+        const std::string m{reinterpret_cast<const char*>(d.data()), d.size()};
+        if (!wait_first->done) {
+            first_msg = m;
+            wait_first->signal();
+        } else {
+            echo_msg = m;
+            wait_echo->signal();
+        }
+    };
+    h.on_close = [](httpmech::WebSocketSession&, std::uint16_t, std::string_view) {};
+    h.on_error = [&](std::error_code ec) {
+        conn_ec = ec;
+        wait_open->signal();
+    };
+
+    REQUIRE(cli->connect(std::move(h)));
+    CHECK(wait_open->wait());
+    CHECK(!conn_ec);
+    CHECK(cli->is_open());
+
+    CHECK(wait_first->wait());
+    CHECK_EQ(first_msg, std::string{"server-hello"});
+
+    CHECK(wait_echo->wait());
+    CHECK_EQ(echo_msg, std::string{"client-hi"});
+
+    CHECK_EQ(cli->messages_received(), std::uint64_t{2});
+
+    cli->close();
+    srv->stop();
+}
+
 void test_websocket_e2e()
 {
     g_case = "websocket e2e";
@@ -808,6 +1075,9 @@ int main()
         {"connection close",    test_connection_close_delivery},
         {"linger_zero guard",   test_linger_zero_guard},
         {"websocket e2e",       test_websocket_e2e},
+        {"http client e2e",     test_http_client_e2e},
+        {"http client chunked", test_http_client_chunked},
+        {"websocket client e2e", test_websocket_client_e2e},
 #endif
     };
 

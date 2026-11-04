@@ -622,8 +622,9 @@ bool ServerSession::switch_to_websocket(WebSocketHandlers handlers, WebSocketCon
     };
 
     m_ws = std::make_shared<detail::WsSessionImpl>(
-        std::move(io), std::move(wcfg), std::move(handlers), std::move(path), std::move(real_ip),
-        m_peer, std::move(headers_raw));
+        detail::WsSessionImpl::Role::server, std::move(io), std::move(wcfg),
+        std::move(handlers), std::move(path), std::move(real_ip), m_peer,
+        std::move(headers_raw));
     m_is_ws = true;
 
     // 进 WS 模式后，HTTP 解析器不再使用；缓冲里若有残留字节（pipelining）
