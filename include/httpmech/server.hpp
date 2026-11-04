@@ -310,15 +310,14 @@ public:
     /// 停止监听并关闭所有连接。幂等，可在任意线程调用。
     ///
     /// @warning 不要在本 server 的回调里调用（会把当前连接也关掉）。
-    /// @warning v0.1 的实现走的是 `Mechanism::close_all()`，会关掉该 Mechanism
-    ///          上**所有**监听器与连接。如果一个 Mechanism 上挂了多个 server，
-    ///          请各自用独立的 Mechanism。
+    ///
+    /// @note 只影响本 server：内部调 `Mechanism::unlisten()` 停掉自己的监听器，
+    ///       再关闭本 server 建立的连接。同一个 Mechanism 上的其它 server 不受影响。
     void stop() noexcept;
 
-    /// 实际监听地址。
+    /// 实际监听地址（`cfg.local.port == 0` 时能拿到系统分配的端口）。
     ///
-    /// @note v0.1 返回的是 `cfg.local` 原值：netmech 目前没有暴露"bind 之后
-    ///       实际端口"，所以 **`cfg.local.port` 请显式给一个非零端口**。
+    /// @note `start()` 之前返回 `cfg.local`。
     [[nodiscard]] netmech::Address local() const;
 
     [[nodiscard]] bool        running() const noexcept;

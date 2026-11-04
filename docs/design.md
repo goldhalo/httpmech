@@ -272,8 +272,10 @@ nginx 与进程同机时配 `{"127.0.0.1"}`。
 | 设计稿写的 | 实际实现 | 原因 |
 |---|---|---|
 | 响应超 64 KiB 自动 chunked | 响应整块缓冲，按 `Content-Length` 发 | 自动 chunked 要求"第一次 write 就定死头部"，属于流式响应；v0.1 的接口（应用只在 `end()` 时收尾）表达不了。JSON 接口够用，流式下一阶段做 |
-| `local()` 返回系统分配的实际端口 | 返回 `cfg.local` 原值 | netmech 没有暴露 bind 后的实际端口；**请显式给非零端口** |
-| `stop()` 只关自己 | 走 `Mechanism::close_all()` | netmech 没有单监听器级 stop；一个 Mechanism 挂多个 server 时要注意 |
+
+> 另两条曾经的偏差（`local()` 拿不到真实端口、`stop()` 只能 `close_all()`）
+> **已经通过补 netmech 接口解决**：`Mechanism::unlisten()` /
+> `listening_address()` / `listening_addresses()`。见下节。
 
 ### 验证
 
@@ -293,3 +295,27 @@ Content-Type: application/json
 
 {"ok":true,"path":"/api/status"}
 ```
+
+---
+
+## 11. 为此补的 netmech 接口
+
+设计时发现两个能力缺口，netmech 是自己的项目，直接补上而不是在 httpmech 里绕：
+
+| 新接口 | 解决的问题 |
+|---|---|
+| `Mechanism::unlisten(const Address&)` | 之前要停服务只能 `close_all()`，按下一个按钮，把同一 Mechanism 上的其它服务一起关掉。现在只停指定监听器，**不动已建立的连接**（关连接是业务层的事） |
+| `Mechanism::listening_address(const Address&)` | `listen(..:0)` 后拿不到系统分配的端口。现在能查回来（`HttpServer::local()` 因此能返回真实端口） |
+| `Mechanism::listening_addresses()` | 列出全部实际监听地址（诊断 / 测试） |
+
+三条语义约定：
+
+1. **端口 0 的入参要求"唯一匹配"**。同一 IP 上并存两个 `:0` 监听时，
+   "问 :0 是哪个"没有唯一答案 → `listening_address()` 返回 `nullopt`，
+   `unlisten()` 不动作。要精确操作就传实际地址。
+2. **`unlisten()` 幂等**：没在监听也算成功。
+3. **`unlisten()` 只停 accept，不关连接**。断开既有连接由调用方负责
+   （httpmech 的 `stop()` 会逐个关自己的会话）。
+
+netmech 侧新增 4 个用例（端口取回、只停目标监听、端口可复用、不误伤其它监听），
+62 个用例 / 791 个断言全过。

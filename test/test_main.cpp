@@ -360,7 +360,7 @@ void test_server_e2e()
     g_case = "server e2e";
 
     httpmech::ServerConfig cfg;
-    cfg.local           = {"127.0.0.1", 18080};
+    cfg.local           = {"127.0.0.1", 0};   // 端口 0：交给系统，再问 local()
     cfg.emit_date       = false;
     cfg.server_name     = "httpmech-ut";
 
@@ -385,8 +385,12 @@ void test_server_e2e()
     CHECK(!ec);
     CHECK(srv->running());
 
+    // 端口 0 的场景：local() 必须给出系统分配的真实端口
+    const std::uint16_t port = srv->local().port();
+    CHECK(port != 0);
+
     // --- 1) 基本 GET ---
-    int fd = tcp_connect("127.0.0.1", 18080);
+    int fd = tcp_connect("127.0.0.1", port);
     CHECK(fd >= 0);
     if (fd >= 0) {
         const std::string r1 = tcp_roundtrip(
@@ -422,6 +426,18 @@ void test_server_e2e()
 
     srv->stop();
     CHECK(!srv->running());
+
+    // 停止后端口应当被释放：同一个端口可以再被别人监听
+    auto mech2 = netmech::Mechanism::create();
+    auto srv2  = httpmech::HttpServer::create(mech2, cfg, router);
+    // 用刚才那个端口重新起一个
+    httpmech::ServerConfig cfg2 = cfg;
+    cfg2.local = {"127.0.0.1", port};
+    auto srv3 = httpmech::HttpServer::create(mech2, cfg2, router);
+    CHECK(srv3 != nullptr);
+    CHECK(!srv3->start());
+    CHECK_EQ(srv3->local().port(), port);
+    srv3->stop();
 }
 
 #endif // !_WIN32

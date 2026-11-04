@@ -87,6 +87,7 @@ struct HttpServer::Impl {
     std::atomic<std::size_t>   conns{0};
 
     std::shared_ptr<netmech::Linkable>                bridge;
+    netmech::Address                                  bound;   ///< 实际监听地址
 
     std::mutex                                        sessions_mu;
     std::vector<std::weak_ptr<detail::ServerSession>> sessions;
@@ -686,6 +687,14 @@ std::error_code HttpServer::start()
         return ec;
     }
 
+    // 取回**实际**绑定地址：cfg.local.port == 0 时端口是系统分配的，
+    // 靠 netmech 的 listening_address() 才拿得到。
+    if (auto actual = m_impl->mech->listening_address(m_impl->cfg.local)) {
+        m_impl->bound = *actual;
+    } else {
+        m_impl->bound = m_impl->cfg.local;
+    }
+
     m_impl->sweeper = std::thread([impl = m_impl] { impl->sweep_loop(); });
     return std::error_code{};
 }
@@ -696,20 +705,35 @@ void HttpServer::stop() noexcept
         return;
     }
 
-    // 关闭该 Mechanism 上所有监听器与连接（见头文件里的 @warning）
+    // 1) 只停**自己这个**监听器（netmech 的 unlisten；不再用 close_all）
     if (m_impl->mech) {
-        m_impl->mech->close_all();
+        const netmech::Address addr =
+            (m_impl->bound.port() != 0) ? m_impl->bound : m_impl->cfg.local;
+        m_impl->mech->unlisten(addr);
     }
     m_impl->bridge.reset();
-    m_impl->stop_sweeper_thread();
 
-    std::lock_guard<std::mutex> lk(m_impl->sessions_mu);
-    m_impl->sessions.clear();
+    // 2) 关掉本服务建立的连接（unlisten 只停 accept，不动既有连接）
+    std::vector<std::shared_ptr<detail::ServerSession>> alive;
+    {
+        std::lock_guard<std::mutex> lk(m_impl->sessions_mu);
+        for (auto& w : m_impl->sessions) {
+            if (auto s = w.lock()) {
+                alive.push_back(s);
+            }
+        }
+        m_impl->sessions.clear();
+    }
+    for (auto& s : alive) {
+        s->close_now();
+    }
+
+    m_impl->stop_sweeper_thread();
 }
 
 netmech::Address HttpServer::local() const
 {
-    return m_impl->cfg.local;
+    return (m_impl->bound.port() != 0) ? m_impl->bound : m_impl->cfg.local;
 }
 
 bool HttpServer::running() const noexcept
