@@ -43,6 +43,9 @@ namespace httpmech {
 
 class HttpServer;
 class Router;
+namespace detail {
+class ServerSession;   ///< 内部：一条连接，见 src/server.cpp
+} // namespace detail
 
 // =============================================================================
 //  响应写入器
@@ -136,6 +139,7 @@ public:
 
 private:
     friend class HttpServer;
+    friend class detail::ServerSession;
     struct Impl;
     explicit ResponseWriter(Impl* impl) noexcept : m_impl(impl) {}
     Impl* m_impl = nullptr;
@@ -283,6 +287,8 @@ struct ServerConfig {
 /// 但不再接受新连接，既有连接在回调返回后被关闭。
 class HttpServer : public std::enable_shared_from_this<HttpServer> {
 public:
+    struct Impl;   ///< 内部实现（不透明，定义在 src/server.cpp）
+
     /// 创建（不监听）。同一个 `Mechanism` 可以挂多个 HttpServer。
     ///
     /// @param[in] mech    netmech 运行时（必须有存活线程池）。
@@ -304,9 +310,15 @@ public:
     /// 停止监听并关闭所有连接。幂等，可在任意线程调用。
     ///
     /// @warning 不要在本 server 的回调里调用（会把当前连接也关掉）。
+    /// @warning v0.1 的实现走的是 `Mechanism::close_all()`，会关掉该 Mechanism
+    ///          上**所有**监听器与连接。如果一个 Mechanism 上挂了多个 server，
+    ///          请各自用独立的 Mechanism。
     void stop() noexcept;
 
-    /// 实际监听地址（`cfg.local.port == 0` 时用来取系统分配的端口）。
+    /// 实际监听地址。
+    ///
+    /// @note v0.1 返回的是 `cfg.local` 原值：netmech 目前没有暴露"bind 之后
+    ///       实际端口"，所以 **`cfg.local.port` 请显式给一个非零端口**。
     [[nodiscard]] netmech::Address local() const;
 
     [[nodiscard]] bool        running() const noexcept;
@@ -315,6 +327,13 @@ public:
     /// 累计处理过的请求数 / 协议错误数（监控用）。
     [[nodiscard]] std::uint64_t requests_total() const noexcept;
     [[nodiscard]] std::uint64_t protocol_errors_total() const noexcept;
+
+private:
+    HttpServer();
+
+    std::shared_ptr<Impl> m_impl;
+
+    friend struct Impl;
 };
 
 } // namespace httpmech

@@ -79,6 +79,7 @@ enum class Status : std::uint16_t {
     other               = 0,     ///< 不在下表里的码，数字见 HttpResponse::status_code
 
     continue_100        = 100,
+    switching_protocols = 101,
 
     ok                  = 200,
     created             = 201,

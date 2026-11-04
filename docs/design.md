@@ -253,3 +253,43 @@ nginx 与进程同机时配 `{"127.0.0.1"}`。
 | 响应入参 | `SHttpResponse&`（可写值） | `ResponseWriter&` + `ResponseSummary` | 支持流式/chunked/升级 |
 | 路由大小写 | 不敏感（`ci_map`） | 敏感（RFC 9110） | 迁移时统一大小写 |
 | 代理头 | 无条件采信 | 白名单（默认仅本地回环） | 防客户端伪造身份 |
+
+---
+
+## 10. 实现进度
+
+| 模块 | 状态 | 说明 |
+|---|---|---|
+| `common` / `headers` / `message` | ✅ | 方法/状态/头部容器/代理头解析 |
+| `parser` | ✅ | 增量解析、chunked、pipelining、两种 body 模式；单元测试 100+ 断言 |
+| `server` | ✅ | netmech 接线、keep-alive、超时清理、协议错误响应、`real_ip()` 白名单 |
+| `router` | ✅ | 精确路由 + before/after + 405/Allow |
+| `websocket` | ⏳ | **握手与帧层未实现**；`upgrade_websocket()` 目前恒返回 false，路由回 `501` |
+| `client` | ⏳ | v0.2 |
+
+### 与设计稿的偏差（实现时发现，已在代码注释里标出）
+
+| 设计稿写的 | 实际实现 | 原因 |
+|---|---|---|
+| 响应超 64 KiB 自动 chunked | 响应整块缓冲，按 `Content-Length` 发 | 自动 chunked 要求"第一次 write 就定死头部"，属于流式响应；v0.1 的接口（应用只在 `end()` 时收尾）表达不了。JSON 接口够用，流式下一阶段做 |
+| `local()` 返回系统分配的实际端口 | 返回 `cfg.local` 原值 | netmech 没有暴露 bind 后的实际端口；**请显式给非零端口** |
+| `stop()` 只关自己 | 走 `Mechanism::close_all()` | netmech 没有单监听器级 stop；一个 Mechanism 挂多个 server 时要注意 |
+
+### 验证
+
+`test/test_main.cpp` 里除了解析器的单元测试，还有一条**端到端**用例：
+起一个真服务端（127.0.0.1:18080），用阻塞 socket 发真请求，覆盖
+GET / POST 带 body / 404 / 405+Allow / 同连接 keep-alive 复用。
+
+另用 `curl` 手工验证过：
+```
+$ curl -s -i http://127.0.0.1:18081/api/status
+HTTP/1.1 200 OK
+Server: httpmech
+Date: Wed, 04 Nov 2026 05:37:00 GMT
+Content-Length: 32
+Connection: keep-alive
+Content-Type: application/json
+
+{"ok":true,"path":"/api/status"}
+```

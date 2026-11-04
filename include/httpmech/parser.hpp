@@ -108,6 +108,12 @@ public:
     [[nodiscard]] const HttpRequest&  request() const noexcept;
     [[nodiscard]] const HttpResponse& response() const noexcept;
 
+    /// 可写引用。**只给 server 层用**：它要在派发前挂 `req.user` /
+    /// `req.from_trusted_proxy` 这两个应用可见的字段。
+    ///
+    /// @warning 其它字段一律视同只读 —— 改了会让下一跳看到不一致的报文语义。
+    [[nodiscard]] HttpRequest& request_mut() noexcept;
+
     /// 流式模式下的一块 body。仅当结果为 `body_chunk` 时有效。
     [[nodiscard]] span<const std::uint8_t> body_chunk() const noexcept;
 
