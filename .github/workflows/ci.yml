@@ -78,6 +78,12 @@ jobs:
   # Windows / MSVC
   #   e2e 用例是 POSIX socket，Windows 上会被 #if 掉；这里主要验证
   #   MSVC 能编过（/utf-8、/W4、模板实例化），以及纯逻辑单测能跑。
+  #
+  #   生成器用 Ninja 而**不用** Visual Studio 生成器，原因：
+  #   前者先报 "could not find any instance of Visual Studio"（镜像里 VS 换版本了），
+  #   改成运行时探测后能找到 VS，又报 "Failed to run MSBuild command: MSBuild.exe
+  #   ... no such file"。与其跟 VS 生成器的探测逻辑搏斗，不如用 msvc-dev-cmd
+  #   把 cl 的环境变量摆好再走 Ninja —— 这也更接近本地能复现的构建方式。
   # ---------------------------------------------------------------------------
   windows:
     name: Windows / MSVC / ${{ matrix.build_type }}
@@ -99,6 +105,11 @@ jobs:
           repository: goldhalo/netmech
           path: netmech
 
+      - name: 配置 MSVC 环境
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       # 说明：把 cmake 的输出抓下来，失败时用 ::error:: 打到 annotation 上。
       # 原因：Actions 的原始日志要通过 API 取需要仓库管理员权限，
       # 而 annotation 是公开可读的 —— 排查 CI 失败时这点很关键。
@@ -106,18 +117,7 @@ jobs:
         working-directory: httpmech
         shell: pwsh
         run: |
-          # 不写死 "Visual Studio 17 2022"：runner 镜像升级后可能只装了更新的
-          # VS（那样会报 "could not find any instance of Visual Studio"）。
-          # 从 cmake --help 里挑一个当前存在的、版本最高的 VS 生成器。
-          $gens = @(cmake --help | Select-String -Pattern '^\s+(Visual Studio \d+ \d{4})\s+=')
-          if ($gens.Count -eq 0) {
-            Write-Host "::error title=没有可用的 Visual Studio 生成器::$(cmake --version) / $(cmake --help | Select-String 'Visual Studio' | Out-String)"
-            exit 1
-          }
-          $gen = $gens[-1].Matches[0].Groups[1].Value
-          Write-Host "使用生成器: $gen"
-
-          $out  = cmake -S . -B build -G $gen -DHTTPMECH_WARNINGS_AS_ERRORS=ON 2>&1 | Out-String
+          $out  = cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DHTTPMECH_WARNINGS_AS_ERRORS=ON 2>&1 | Out-String
           $code = $LASTEXITCODE
           Write-Host $out
           if ($code -ne 0) {
@@ -140,11 +140,11 @@ jobs:
         working-directory: httpmech
         shell: pwsh
         run: |
-          $out  = cmake --build build --config ${{ matrix.build_type }} --parallel 2>&1 | Out-String
+          $out  = cmake --build build --parallel 2>&1 | Out-String
           $code = $LASTEXITCODE
           Write-Host $out
           if ($code -ne 0) {
-            $line = ($out -split "`r?`n" | Where-Object { $_ -match 'error|: fatal' } | Select-Object -First 2) -join ' | '
+            $line = ($out -split "`r?`n" | Where-Object { $_ -match 'error C|: fatal|error MSB' } | Select-Object -First 2) -join ' | '
             Write-Host "::error title=Windows build failed::$line"
             exit 1
           }
@@ -153,8 +153,16 @@ jobs:
         working-directory: httpmech
         shell: pwsh
         run: |
-          & ".\build\bin\${{ matrix.build_type }}\httpmech_ut.exe"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = ".\build\bin\httpmech_ut.exe"
+          if (-not (Test-Path $exe)) { Write-Host "::error::找不到 $exe"; exit 1 }
+          $out  = & $exe 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $out
+          if ($code -ne 0) {
+            $line = ($out -split "`r?`n" | Where-Object { $_ -match 'FAIL' } | Select-Object -First 3) -join ' | '
+            Write-Host "::error title=Windows 单测失败::$line"
+            exit 1
+          }
 
   # ---------------------------------------------------------------------------
   # 安装 / find_package 冒烟测试
