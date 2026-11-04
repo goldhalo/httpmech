@@ -106,12 +106,21 @@ jobs:
         working-directory: httpmech
         shell: pwsh
         run: |
-          $out  = cmake -S . -B build -G "Visual Studio 17 2022" -DHTTPMECH_WARNINGS_AS_ERRORS=ON 2>&1 | Out-String
+          # 不写死 "Visual Studio 17 2022"：runner 镜像升级后可能只装了更新的
+          # VS（那样会报 "could not find any instance of Visual Studio"）。
+          # 从 cmake --help 里挑一个当前存在的、版本最高的 VS 生成器。
+          $gens = @(cmake --help | Select-String -Pattern '^\s+(Visual Studio \d+ \d{4})\s+=')
+          if ($gens.Count -eq 0) {
+            Write-Host "::error title=没有可用的 Visual Studio 生成器::$(cmake --version) / $(cmake --help | Select-String 'Visual Studio' | Out-String)"
+            exit 1
+          }
+          $gen = $gens[-1].Matches[0].Groups[1].Value
+          Write-Host "使用生成器: $gen"
+
+          $out  = cmake -S . -B build -G $gen -DHTTPMECH_WARNINGS_AS_ERRORS=ON 2>&1 | Out-String
           $code = $LASTEXITCODE
           Write-Host $out
           if ($code -ne 0) {
-            # 只抓 "CMake Error at ..." 这一行没用（真正的原因在它下面几行），
-            # 把错误行 + 之后 3 行一起打进 annotation。
             $lines = $out -split "`r?`n"
             $idx = -1
             for ($i = 0; $i -lt $lines.Count; $i++) {
