@@ -86,7 +86,7 @@ void append_frame(std::string& out, std::uint8_t opcode, bool fin,
 // =============================================================================
 
 WsSessionImpl::WsSessionImpl(Role role, WsIo io, WebSocketConfig cfg, WebSocketHandlers handlers,
-                             std::string path, std::string real_ip, netmech::Address peer,
+                             std::string path, std::string real_ip, Endpoint peer,
                              std::string handshake_headers_raw)
     : m_role(role)
     , m_io(std::move(io))

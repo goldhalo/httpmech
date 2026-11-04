@@ -9,6 +9,7 @@
 #pragma once
 
 #include <httpmech/common.hpp>
+#include <httpmech/endpoint.hpp>
 #include <httpmech/span.hpp>
 #include <httpmech/headers.hpp>
 #include <httpmech/message.hpp>

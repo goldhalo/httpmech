@@ -16,12 +16,14 @@
 // =============================================================================
 #include <httpmech/client.hpp>
 
+#include "net_bridge.hpp"
 #include "sha1_base64.hpp"
 #include "ws_internal.hpp"
 
 #include <netmech/conn.hpp>
 #include <netmech/iohandler.hpp>
 #include <netmech/linkable.hpp>
+#include <netmech/mechanism.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -37,12 +39,12 @@ namespace httpmech {
 
 namespace {
 
-std::string host_of(const netmech::Address& a)
+std::string host_of(const Endpoint& ep)
 {
-    std::string h = a.address_string();
-    if (a.port() != 80) {
+    std::string h = ep.host();
+    if (ep.port() != 80) {
         h += ':';
-        h += std::to_string(a.port());
+        h += std::to_string(ep.port());
     }
     return h;
 }
@@ -503,7 +505,7 @@ void HttpClient::Impl::do_connect()
         linkable = lb;                 // 保活：否则 connect 一返回就失效
     }
     const auto ec = mech->connect(
-        cfg.remote, lb, static_cast<std::uint32_t>(cfg.connect_timeout.count()));
+        detail::to_address(cfg.remote), lb, static_cast<std::uint32_t>(cfg.connect_timeout.count()));
     if (ec) {
         {
             std::lock_guard<std::mutex> lk(mu);
@@ -601,8 +603,13 @@ HttpClient::~HttpClient()
     m_impl->ticker.stop();
 }
 
-std::shared_ptr<HttpClient> HttpClient::create(std::shared_ptr<netmech::Mechanism> mech,
-                                               ClientConfig                       cfg)
+std::shared_ptr<HttpClient> HttpClient::create(ClientConfig cfg)
+{
+    return create_with_mechanism(netmech::Mechanism::create(), std::move(cfg));
+}
+
+std::shared_ptr<HttpClient> HttpClient::create_with_mechanism(
+    std::shared_ptr<netmech::Mechanism> mech, ClientConfig cfg)
 {
     if (!mech) {
         return nullptr;
@@ -969,8 +976,13 @@ WebSocketClient::~WebSocketClient()
     m_impl->ticker.stop();
 }
 
-std::shared_ptr<WebSocketClient> WebSocketClient::create(std::shared_ptr<netmech::Mechanism> mech,
-                                                         WebSocketClientConfig              cfg)
+std::shared_ptr<WebSocketClient> WebSocketClient::create(WebSocketClientConfig cfg)
+{
+    return create_with_mechanism(netmech::Mechanism::create(), std::move(cfg));
+}
+
+std::shared_ptr<WebSocketClient> WebSocketClient::create_with_mechanism(
+    std::shared_ptr<netmech::Mechanism> mech, WebSocketClientConfig cfg)
 {
     if (!mech) {
         return nullptr;
@@ -1019,7 +1031,7 @@ bool WebSocketClient::connect(WebSocketClientHandlers handlers)
     }
 
     const auto ec = m_impl->mech->connect(
-        m_impl->cfg.remote, lb,
+        detail::to_address(m_impl->cfg.remote), lb,
         static_cast<std::uint32_t>(m_impl->cfg.connect_timeout.count()));
     if (ec) {
         {

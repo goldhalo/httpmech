@@ -22,11 +22,6 @@ int main(int argc, char** argv)
     const std::uint16_t port = (argc > 1) ? static_cast<std::uint16_t>(std::atoi(argv[1]))
                                           : 8080;
 
-    if (!netmech::initialize(0)) {
-        std::fprintf(stderr, "netmech initialize 失败\n");
-        return 1;
-    }
-
     auto router = std::make_shared<httpmech::Router>();
 
     router->before([](httpmech::HttpRequest&, httpmech::ResponseWriter&) { return true; });
@@ -78,8 +73,10 @@ int main(int argc, char** argv)
     cfg.local       = {"0.0.0.0", port};
     cfg.server_name = "httpmech";
 
-    auto mech = netmech::Mechanism::create();
-    auto srv  = httpmech::HttpServer::create(mech, cfg, router);
+    // 不再需要 netmech：server 自己建 io 运行时。
+    // 想控制 io 线程数（默认 = CPU 核数）时，先调一次 netmech::initialize(n)，
+    // 或用 create_with_mechanism() 传入共享的 Mechanism。
+    auto srv = httpmech::HttpServer::create(cfg, router);
     if (!srv) {
         std::fprintf(stderr, "create 失败（handler 为空？）\n");
         return 1;
@@ -97,6 +94,5 @@ int main(int argc, char** argv)
     }
 
     srv->stop();
-    netmech::shutdown();
     return 0;
 }

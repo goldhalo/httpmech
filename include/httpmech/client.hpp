@@ -3,7 +3,8 @@
 // =============================================================================
 //  文件    : httpmech/client.hpp
 //  用途    : HttpClient —— 一条到目标地址的连接，串行发请求、收响应。
-//  依赖    : netmech（Mechanism / Linkable / Conn）+ 本库 parser。
+//  依赖    : 标准库 + 本库 parser。**公共头不引 netmech** —— 需要共享同一份
+//            io 池时才用 create_with_mechanism()。
 //  编码    : UTF-8
 //
 //  ★ 状态：v0.2 已实现
@@ -32,15 +33,17 @@
 #include <string_view>
 #include <system_error>
 
-#include <netmech/common.hpp>
-#include <netmech/mechanism.hpp>
-
 #include <httpmech/common.hpp>
+#include <httpmech/endpoint.hpp>
 #include <httpmech/headers.hpp>
 #include <httpmech/message.hpp>
 #include <httpmech/parser.hpp>
 #include <httpmech/span.hpp>
 #include <httpmech/websocket.hpp>
+
+namespace netmech {
+class Mechanism;   // 前向声明（仅 create_with_mechanism 用）
+} // namespace netmech
 
 namespace httpmech {
 
@@ -103,7 +106,7 @@ public:
 
 struct ClientConfig {
     /// 目标地址（含端口）。`Host:` 头按它填（`IP:port`，端口 80 时省略）。
-    netmech::Address remote{"127.0.0.1", 80};
+    Endpoint remote{"127.0.0.1", 80};
 
     Limits           limits{};
     Parser::BodyMode body_mode = Parser::BodyMode::aggregate;
@@ -149,9 +152,12 @@ class HttpClient : public std::enable_shared_from_this<HttpClient> {
 public:
     struct Impl;   ///< 内部实现（不透明，定义在 src/client.cpp）
 
-    /// 创建（不连接）。首次 `request()` 时自动连接。
-    static std::shared_ptr<HttpClient> create(std::shared_ptr<netmech::Mechanism> mech,
-                                              ClientConfig                       cfg);
+    /// 创建（不连接）。首次 `request()` 时自动连接。io 运行时由本库内部创建。
+    static std::shared_ptr<HttpClient> create(ClientConfig cfg);
+
+    /// 复用外部 io 运行时（一个进程里多个库共用一份线程池时用）。
+    static std::shared_ptr<HttpClient> create_with_mechanism(
+        std::shared_ptr<netmech::Mechanism> mech, ClientConfig cfg);
 
     ~HttpClient();
 
@@ -189,7 +195,7 @@ private:
 
 struct WebSocketClientConfig {
     /// 服务端地址（含端口）。
-    netmech::Address remote{"127.0.0.1", 80};
+    Endpoint remote{"127.0.0.1", 80};
 
     /// 握手请求的路径（含 query），例如 `"/ws/events?token=abc"`。
     std::string path{"/"};
@@ -251,8 +257,11 @@ class WebSocketClient : public std::enable_shared_from_this<WebSocketClient> {
 public:
     struct Impl;   ///< 内部实现（不透明，定义在 src/client.cpp）
 
-    static std::shared_ptr<WebSocketClient> create(std::shared_ptr<netmech::Mechanism> mech,
-                                                   WebSocketClientConfig              cfg);
+    static std::shared_ptr<WebSocketClient> create(WebSocketClientConfig cfg);
+
+    /// 复用外部 io 运行时。
+    static std::shared_ptr<WebSocketClient> create_with_mechanism(
+        std::shared_ptr<netmech::Mechanism> mech, WebSocketClientConfig cfg);
 
     ~WebSocketClient();
 

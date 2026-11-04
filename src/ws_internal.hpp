@@ -13,6 +13,7 @@
 #include <memory>
 #include <string>
 
+#include <httpmech/endpoint.hpp>
 #include <httpmech/websocket.hpp>
 
 namespace httpmech {
@@ -41,7 +42,7 @@ public:
                   WebSocketHandlers           handlers,
                   std::string                 path,
                   std::string                 real_ip,
-                  netmech::Address            peer,
+                  Endpoint                     peer,
                   std::string                 handshake_headers_raw);
 
     ~WsSessionImpl() override = default;
@@ -54,7 +55,7 @@ public:
     void close(std::uint16_t code, std::string_view reason) override;
 
     [[nodiscard]] bool                 is_open() const noexcept override;
-    [[nodiscard]] netmech::Address     remote() const noexcept override { return m_peer; }
+    [[nodiscard]] Endpoint             remote() const noexcept override { return m_peer; }
     [[nodiscard]] std::string_view     real_ip() const noexcept override { return m_real_ip; }
     [[nodiscard]] std::string_view     path() const noexcept override { return m_path; }
     [[nodiscard]] std::string_view     handshake_header(std::string_view name) const noexcept override;
@@ -90,7 +91,7 @@ private:
     WebSocketHandlers                  m_handlers;
     std::string                        m_path;
     std::string                        m_real_ip;
-    netmech::Address                   m_peer;
+    Endpoint                           m_peer;
     std::string                        m_headers_raw;
 
     std::string          m_in;          ///< 接收缓冲（未消费字节）

@@ -18,9 +18,11 @@
 // =============================================================================
 #include <httpmech/server.hpp>
 
+#include "net_bridge.hpp"
 #include "ws_internal.hpp"
 
 #include <netmech/conn.hpp>
+#include <netmech/mechanism.hpp>
 #include <netmech/iohandler.hpp>
 #include <netmech/linkable.hpp>
 
@@ -90,7 +92,7 @@ struct HttpServer::Impl {
     std::atomic<std::size_t>   conns{0};
 
     std::shared_ptr<netmech::Linkable>                bridge;
-    netmech::Address                                  bound;   ///< 实际监听地址
+    Endpoint                                          bound;   ///< 实际监听地址
 
     std::mutex                                        sessions_mu;
     std::vector<std::weak_ptr<detail::ServerSession>> sessions;
@@ -137,7 +139,8 @@ public:
 
     ResponseWriter::Impl* writer_state() noexcept { return &m_writer; }
     const ServerConfig&   cfg() const noexcept { return m_owner->cfg; }
-    netmech::Address      peer() const noexcept { return m_peer; }
+    netmech::Address      peer_address() const noexcept { return m_peer; }
+    Endpoint              peer() const noexcept { return detail::from_address(m_peer); }
 
     // --- netmech::ConnHandler ---
 
@@ -623,7 +626,7 @@ bool ServerSession::switch_to_websocket(WebSocketHandlers handlers, WebSocketCon
 
     m_ws = std::make_shared<detail::WsSessionImpl>(
         detail::WsSessionImpl::Role::server, std::move(io), std::move(wcfg),
-        std::move(handlers), std::move(path), std::move(real_ip), m_peer,
+        std::move(handlers), std::move(path), std::move(real_ip), detail::from_address(m_peer),
         std::move(headers_raw));
     m_is_ws = true;
 
@@ -739,14 +742,27 @@ HttpServer::~HttpServer()
     m_impl->stop_sweeper_thread();
 }
 
-std::shared_ptr<HttpServer> HttpServer::create(std::shared_ptr<netmech::Mechanism> mech,
-                                               ServerConfig                       cfg,
-                                               std::shared_ptr<RequestHandler>    handler)
+std::shared_ptr<HttpServer> HttpServer::create(ServerConfig                    cfg,
+                                              std::shared_ptr<RequestHandler> handler)
+{
+    if (!handler) {
+        return nullptr;
+    }
+    // 自己建 io 运行时：调用方不需要认识 netmech。
+    // netmech 的线程池是**进程级懒建**的，所以这里 create() 不会白起线程；
+    // 真正用到网络时才建（线程数由 netmech::initialize() 决定，默认 hw 核数）。
+    return create_with_mechanism(netmech::Mechanism::create(), std::move(cfg),
+                                 std::move(handler));
+}
+
+std::shared_ptr<HttpServer> HttpServer::create_with_mechanism(
+    std::shared_ptr<netmech::Mechanism> mech, ServerConfig cfg,
+    std::shared_ptr<RequestHandler> handler)
 {
     if (!mech || !handler) {
         return nullptr;
     }
-    auto srv       = std::shared_ptr<HttpServer>(new HttpServer());
+    auto srv             = std::shared_ptr<HttpServer>(new HttpServer());
     srv->m_impl->mech    = std::move(mech);
     srv->m_impl->cfg     = std::move(cfg);
     srv->m_impl->handler = std::move(handler);
@@ -774,7 +790,8 @@ std::error_code HttpServer::start()
     auto bridge     = std::make_shared<detail::AcceptBridge>(m_impl);
     m_impl->bridge  = bridge;
 
-    const auto ec = m_impl->mech->listen(m_impl->cfg.local, bridge, m_impl->cfg.backlog);
+    const auto ec = m_impl->mech->listen(detail::to_address(m_impl->cfg.local), bridge,
+                                         m_impl->cfg.backlog);
     if (ec) {
         m_impl->bridge.reset();
         m_impl->running.store(false);
@@ -783,8 +800,8 @@ std::error_code HttpServer::start()
 
     // 取回**实际**绑定地址：cfg.local.port == 0 时端口是系统分配的，
     // 靠 netmech 的 listening_address() 才拿得到。
-    if (auto actual = m_impl->mech->listening_address(m_impl->cfg.local)) {
-        m_impl->bound = *actual;
+    if (auto actual = m_impl->mech->listening_address(detail::to_address(m_impl->cfg.local))) {
+        m_impl->bound = detail::from_address(*actual);
     } else {
         m_impl->bound = m_impl->cfg.local;
     }
@@ -801,9 +818,8 @@ void HttpServer::stop() noexcept
 
     // 1) 只停**自己这个**监听器（netmech 的 unlisten；不再用 close_all）
     if (m_impl->mech) {
-        const netmech::Address addr =
-            (m_impl->bound.port() != 0) ? m_impl->bound : m_impl->cfg.local;
-        m_impl->mech->unlisten(addr);
+        const Endpoint addr = (m_impl->bound.port() != 0) ? m_impl->bound : m_impl->cfg.local;
+        m_impl->mech->unlisten(detail::to_address(addr));
     }
     m_impl->bridge.reset();
 
@@ -825,7 +841,7 @@ void HttpServer::stop() noexcept
     m_impl->stop_sweeper_thread();
 }
 
-netmech::Address HttpServer::local() const
+Endpoint HttpServer::local() const
 {
     return (m_impl->bound.port() != 0) ? m_impl->bound : m_impl->cfg.local;
 }

@@ -4,7 +4,8 @@
 //  文件    : httpmech/server.hpp
 //  用途    : HttpServer —— 在 netmech 的 listen 之上，把每个连接包装成
 //            "解析请求 → 回调应用 → 写响应 → 复用或关闭"。
-//  依赖    : netmech（Mechanism / Linkable / Conn）+ 本库 parser。
+//  依赖    : 标准库 + 本库 parser。**公共头不引 netmech** —— 需要共享同一份
+//            io 池时才用 create_with_mechanism()，那时由调用方自己引 netmech 头。
 //  编码    : UTF-8
 //
 //  ★ 定位：只做协议，不做框架
@@ -29,15 +30,17 @@
 #include <system_error>
 #include <vector>
 
-#include <netmech/common.hpp>
-#include <netmech/mechanism.hpp>
-
 #include <httpmech/common.hpp>
+#include <httpmech/endpoint.hpp>
 #include <httpmech/headers.hpp>
 #include <httpmech/message.hpp>
 #include <httpmech/parser.hpp>
 #include <httpmech/span.hpp>
 #include <httpmech/websocket.hpp>
+
+namespace netmech {
+class Mechanism;   // 前向声明：仅 create_with_mechanism() 用到，不需要它的头
+} // namespace netmech
 
 namespace httpmech {
 
@@ -227,7 +230,7 @@ public:
 
 struct ServerConfig {
     /// 监听地址。端口 0 表示由系统分配，起来后用 `local()` 取实际端口。
-    netmech::Address local{"0.0.0.0", 0};
+    Endpoint local{"0.0.0.0", 0};
 
     Limits            limits{};
     Parser::BodyMode  body_mode = Parser::BodyMode::aggregate;
@@ -300,15 +303,24 @@ class HttpServer : public std::enable_shared_from_this<HttpServer> {
 public:
     struct Impl;   ///< 内部实现（不透明，定义在 src/server.cpp）
 
-    /// 创建（不监听）。同一个 `Mechanism` 可以挂多个 HttpServer。
+    /// 创建（不监听）。**自己建内部 io 运行时**，调用方不需要认识 netmech。
     ///
-    /// @param[in] mech    netmech 运行时（必须有存活线程池）。
     /// @param[in] cfg     服务端配置。
     /// @param[in] handler 业务回调；server 持有 shared_ptr。
     ///                    **不能为空**，为空时返回 nullptr。
-    static std::shared_ptr<HttpServer> create(std::shared_ptr<netmech::Mechanism> mech,
-                                              ServerConfig                       cfg,
-                                              std::shared_ptr<RequestHandler>    handler);
+    static std::shared_ptr<HttpServer> create(ServerConfig                    cfg,
+                                              std::shared_ptr<RequestHandler> handler);
+
+    /// 创建并**复用外部 io 运行时**（一个进程里多个库想共用一份线程池时用）。
+    ///
+    /// @param[in] mech netmech 的 Mechanism；调用方自己 #include <netmech/mechanism.hpp>
+    ///                 把它的 shared_ptr 传进来。生命周期由本库共享持有。
+    /// @note 公共头只对 `netmech::Mechanism` 做**前向声明**，所以不用 netmech
+    ///       的头也能编译、链接本库；只有走这个重载时才需要。
+    static std::shared_ptr<HttpServer> create_with_mechanism(
+        std::shared_ptr<netmech::Mechanism> mech,
+        ServerConfig                        cfg,
+        std::shared_ptr<RequestHandler>     handler);
 
     ~HttpServer();
 
@@ -329,7 +341,7 @@ public:
     /// 实际监听地址（`cfg.local.port == 0` 时能拿到系统分配的端口）。
     ///
     /// @note `start()` 之前返回 `cfg.local`。
-    [[nodiscard]] netmech::Address local() const;
+    [[nodiscard]] Endpoint local() const;
 
     [[nodiscard]] bool        running() const noexcept;
     [[nodiscard]] std::size_t connection_count() const noexcept;

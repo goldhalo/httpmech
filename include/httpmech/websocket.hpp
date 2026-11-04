@@ -27,9 +27,8 @@
 #include <string>
 #include <string_view>
 
-#include <netmech/common.hpp>
-
 #include <httpmech/common.hpp>
+#include <httpmech/endpoint.hpp>
 #include <httpmech/span.hpp>
 
 namespace httpmech {
@@ -128,7 +127,7 @@ public:
     [[nodiscard]] virtual bool is_open() const noexcept = 0;
 
     /// 对端 TCP 地址（nginx 接的，通常是 127.0.0.1）。
-    [[nodiscard]] virtual netmech::Address remote() const noexcept = 0;
+    [[nodiscard]] virtual Endpoint remote() const noexcept = 0;
 
     /// 真实客户端 IP（同 `HttpRequest::real_ip()`，握手时算好存下来）。
     /// 前提是配了 `ServerConfig::trusted_proxy_cidrs`，否则为空。

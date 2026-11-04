@@ -10,6 +10,8 @@ TLS、HTTP/2、静态文件都交给前面的 nginx，本库只处理它转过�
                        (TLS 终结)                (本库)
 ```
 
+- **公共头不依赖 netmech**：只用 httpmech 时不需要把 netmech 的头挂到 include 路径上
+  （链接仍需要 `libnetmech.a`，见下方"依赖"）
 - 自带路由、before/after 钩子、WebSocket（握手 + 帧层），**零外部依赖**
 - C++17，不引 Boost / OpenSSL；WebSocket 握手用的 SHA-1 + Base64 也是自带的
 - 212 个断言（单元 + 端到端），CI 覆盖 Linux（gcc/clang × Debug/Release）与 Windows MSVC
@@ -44,11 +46,6 @@ TLS、HTTP/2、静态文件都交给前面的 nginx，本库只处理它转过�
 
 int main()
 {
-    if (!netmech::initialize(0)) {                // 启动 netmech 的 io 线程池
-        std::fprintf(stderr, "netmech initialize 失败\n");
-        return 1;
-    }
-
     auto router = std::make_shared<httpmech::Router>();
 
     // ---- 鉴权：before 返回 false 表示已回响应，后续不再走 ----
@@ -106,8 +103,8 @@ int main()
     cfg.local           = {"127.0.0.1", 8080};   // 0 也行，start() 后用 local() 取真实端口
     cfg.trusted_proxies = {"127.0.0.1"};         // 采信 nginx 的 X-Real-IP
 
-    auto mech = netmech::Mechanism::create();
-    auto srv  = httpmech::HttpServer::create(mech, cfg, router);
+    // 不需要 netmech：server 自己建 io 运行时
+    auto srv = httpmech::HttpServer::create(cfg, router);
     if (auto ec = srv->start()) {
         std::fprintf(stderr, "start 失败: %s\n", ec.message().c_str());
         return 1;
@@ -117,7 +114,6 @@ int main()
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
     srv->stop();
-    netmech::shutdown();
 }
 ```
 
@@ -148,7 +144,7 @@ public:
     }
 };
 
-auto srv = httpmech::HttpServer::create(mech, cfg, std::make_shared<MyHandler>());
+auto srv = httpmech::HttpServer::create(cfg, std::make_shared<MyHandler>());
 ```
 
 ### 大 body：流式收
@@ -192,7 +188,7 @@ public:
 httpmech::ClientConfig ccfg;
 ccfg.remote = {"192.168.3.10", 9898};
 
-auto cli = httpmech::HttpClient::create(mech, ccfg);
+auto cli = httpmech::HttpClient::create(ccfg);
 
 class MyHandler : public httpmech::ResponseHandler {
 public:
@@ -221,7 +217,7 @@ httpmech::WebSocketClientConfig wcfg;
 wcfg.remote = {"192.168.3.10", 8080};
 wcfg.path   = "/ws/events";
 
-auto ws = httpmech::WebSocketClient::create(mech, wcfg);
+auto ws = httpmech::WebSocketClient::create(wcfg);
 
 httpmech::WebSocketClientHandlers h;
 h.on_open    = [](httpmech::WebSocketSession& s) { s.send_text("hi"); };
@@ -249,7 +245,7 @@ ws->connect(std::move(h));      // 异步：结果走回调
 httpmech::ClientConfig ccfg;
 ccfg.remote = {"192.168.3.10", 9898};
 
-auto cli = httpmech::HttpClient::create(mech, ccfg);
+auto cli = httpmech::HttpClient::create(ccfg);
 
 class MyHandler : public httpmech::ResponseHandler {
 public:
@@ -280,7 +276,7 @@ httpmech::WebSocketClientConfig wcfg;
 wcfg.remote = {"192.168.3.10", 8080};
 wcfg.path   = "/ws/events";
 
-auto ws = httpmech::WebSocketClient::create(mech, wcfg);
+auto ws = httpmech::WebSocketClient::create(wcfg);
 
 httpmech::WebSocketClientHandlers h;
 h.on_open    = [](httpmech::WebSocketSession& s) { s.send_text("hi"); };
@@ -404,5 +400,14 @@ httpmech/
 ## 依赖与许可
 
 - 传输：[netmech](https://github.com/goldhalo/netmech)（自带 Asio，无需安装 Boost）
+  - **头层面不依赖**：`include/httpmech/*.hpp` 里没有 `#include <netmech/...>`，
+    只有 `create_with_mechanism()` 对 `netmech::Mechanism` 做前向声明。
+    所以"只想用 httpmech"的项目不必准备 netmech 的头。
+  - **链接层面需要**：`libhttpmech.a` 内部调用 netmech，最终要链上 `libnetmech.a`
+    （`find_package(httpmech)` 会自动带出来）。
+  - 一个进程里跑多个库（比如 httpmech + modbusmech）时，想让它们共用一份 io 线程池：
+    先调一次 `netmech::initialize(n)`，或各自 `create_with_mechanism()` 传同一个
+    `Mechanism`。不传的话每个库自己建一个（线程池仍是进程级共享的，只是 `Mechanism`
+    各管各的监听器）。
 - 解析：[picohttpparser](https://github.com/h2o/picohttpparser)（MIT，已 vendored）
 - 本库：MIT，见 [LICENSE](LICENSE)

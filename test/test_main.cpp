@@ -3,6 +3,9 @@
 // =============================================================================
 #include <httpmech/httpmech.hpp>
 
+// 只有 linger_zero 那个用例需要直接构造 netmech 的 Mechanism
+#include <netmech/mechanism.hpp>
+
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -495,8 +498,7 @@ void test_connection_close_delivery()
         out.end();
     });
 
-    auto mech = netmech::Mechanism::create();
-    auto srv  = httpmech::HttpServer::create(mech, cfg, router);
+    auto srv  = httpmech::HttpServer::create(cfg, router);
     REQUIRE(srv != nullptr);
     REQUIRE(!srv->start());
 
@@ -552,7 +554,7 @@ void test_linger_zero_guard()
     httpmech::ServerConfig cfg;
     cfg.local = {"127.0.0.1", 0};
 
-    auto srv = httpmech::HttpServer::create(mech_bad, cfg, router);
+    auto srv = httpmech::HttpServer::create_with_mechanism(mech_bad, cfg, router);
     REQUIRE(srv != nullptr);
     const auto ec = srv->start();
     CHECK(ec == httpmech::make_error_code(httpmech::Errc::linger_zero_enabled));
@@ -561,7 +563,7 @@ void test_linger_zero_guard()
     // 显式放开后允许启动（自己承担丢应答的风险）
     httpmech::ServerConfig cfg2 = cfg;
     cfg2.allow_linger_zero      = true;
-    auto srv2 = httpmech::HttpServer::create(mech_bad, cfg2, router);
+    auto srv2 = httpmech::HttpServer::create_with_mechanism(mech_bad, cfg2, router);
     REQUIRE(srv2 != nullptr);
     CHECK(!srv2->start());
     srv2->stop();
@@ -634,15 +636,14 @@ void test_http_client_e2e()
         out.end();
     });
 
-    auto srv_mech = netmech::Mechanism::create();
-    auto srv      = httpmech::HttpServer::create(srv_mech, cfg, router);
+    auto srv = httpmech::HttpServer::create(cfg, router);
     REQUIRE(srv != nullptr);
     REQUIRE(!srv->start());
 
     // --- 客户端连过去 ---
     httpmech::ClientConfig ccfg;
     ccfg.remote = {"127.0.0.1", srv->local().port()};
-    auto cli    = httpmech::HttpClient::create(netmech::Mechanism::create(), ccfg);
+    auto cli    = httpmech::HttpClient::create(ccfg);
     REQUIRE(cli != nullptr);
 
     // 1) GET
@@ -732,7 +733,7 @@ void test_http_client_chunked()
 
     httpmech::ClientConfig ccfg;
     ccfg.remote = {"127.0.0.1", port};
-    auto cli    = httpmech::HttpClient::create(netmech::Mechanism::create(), ccfg);
+    auto cli    = httpmech::HttpClient::create(ccfg);
     REQUIRE(cli != nullptr);
 
     auto w = std::make_shared<Waiter>();
@@ -772,8 +773,7 @@ void test_websocket_client_e2e()
     };
     router->websocket("/ws", std::move(ws));
 
-    auto srv_mech = netmech::Mechanism::create();
-    auto srv      = httpmech::HttpServer::create(srv_mech, cfg, router);
+    auto srv = httpmech::HttpServer::create(cfg, router);
     REQUIRE(srv != nullptr);
     REQUIRE(!srv->start());
 
@@ -781,7 +781,7 @@ void test_websocket_client_e2e()
     httpmech::WebSocketClientConfig wcfg;
     wcfg.remote = {"127.0.0.1", srv->local().port()};
     wcfg.path   = "/ws";
-    auto cli    = httpmech::WebSocketClient::create(netmech::Mechanism::create(), wcfg);
+    auto cli    = httpmech::WebSocketClient::create(wcfg);
     REQUIRE(cli != nullptr);
 
     auto wait_open  = std::make_shared<Waiter>();
@@ -853,8 +853,7 @@ void test_websocket_e2e()
     };
     router->websocket("/ws", std::move(ws));
 
-    auto mech = netmech::Mechanism::create();
-    auto srv  = httpmech::HttpServer::create(mech, cfg, router);
+    auto srv  = httpmech::HttpServer::create(cfg, router);
     REQUIRE(srv != nullptr);
     REQUIRE(!srv->start());
     const std::uint16_t port = srv->local().port();
@@ -973,8 +972,7 @@ void test_server_e2e()
         out.end();
     });
 
-    auto mech = netmech::Mechanism::create();
-    auto srv  = httpmech::HttpServer::create(mech, cfg, router);
+    auto srv  = httpmech::HttpServer::create(cfg, router);
     CHECK(srv != nullptr);
     const auto ec = srv->start();
     CHECK(!ec);
@@ -1023,12 +1021,11 @@ void test_server_e2e()
     CHECK(!srv->running());
 
     // 停止后端口应当被释放：同一个端口可以再被别人监听
-    auto mech2 = netmech::Mechanism::create();
-    auto srv2  = httpmech::HttpServer::create(mech2, cfg, router);
+    auto srv2  = httpmech::HttpServer::create(cfg, router);
     // 用刚才那个端口重新起一个
     httpmech::ServerConfig cfg2 = cfg;
     cfg2.local = {"127.0.0.1", port};
-    auto srv3 = httpmech::HttpServer::create(mech2, cfg2, router);
+    auto srv3 = httpmech::HttpServer::create(cfg2, router);
     CHECK(srv3 != nullptr);
     CHECK(!srv3->start());
     CHECK_EQ(srv3->local().port(), port);

@@ -356,6 +356,18 @@ jobs:
           fi
           echo "✅ 对外头文件无 asio 依赖"
 
+      - name: 检查对外头文件不依赖 netmech
+        run: |
+          # 公共头不 #include 任何 netmech 头：使用者装本库时不需要再准备
+          # netmech 的头（链接时仍需要 libnetmech.a，这一点在 README 里写清）。
+          # 只有 create_with_mechanism 那类"可选注入"会前向声明 netmech::Mechanism。
+          if grep -rnE '^[[:space:]]*#[[:space:]]*include[[:space:]]*<netmech/' \
+               include/ --include='*.hpp'; then
+            echo "❌ 对外头文件包含了 netmech 的头（公共 API 不该要求它）"
+            exit 1
+          fi
+          echo "✅ 对外头文件无 netmech 头依赖"
+
       - name: 检查每个对外头文件可单独包含
         run: |
           sudo apt-get update && sudo apt-get install -y g++
