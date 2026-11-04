@@ -231,6 +231,49 @@ jobs:
           /tmp/consumer/build/app
 
   # ---------------------------------------------------------------------------
+  # ASan + UBSan
+  #
+  # 为什么要单独跑一遍：越界读和"无符号下溢"在 Release 上通常**没有任何症状** ——
+  # 读到垃圾数据被当成未知字段跳过，或者循环多转几圈但结果碰巧对。
+  # 2026-11 就出过一次：mpegmech 的 test_g711_ps 在 Windows Debug 上卡 120 秒，
+  # 根因是 `in[code_at]` 越界读 + `in.size() - scan` 下溢；Linux Release 一直绿。
+  #
+  # 关掉 detect_leaks：库里有些对象是刻意长命的（进程级 io 池等），
+  # 让 LeakSanitizer 报它们只会训练大家忽略告警。
+  # ---------------------------------------------------------------------------
+  sanitizers:
+    name: ASan + UBSan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装工具
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++
+
+      - name: 配置（Debug + sanitizer）
+        run: |
+          cmake -S . -B build-san -G Ninja \
+                -DCMAKE_BUILD_TYPE=Debug \
+                -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g" \
+                -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g" \
+                -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
+                -DHTTPMECH_BUILD_TESTS=ON
+
+      - name: 构建
+        run: cmake --build build-san --parallel
+
+      - name: 测试（sanitizer 一旦报错立即失败）
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1:strict_string_checks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          LSAN_OPTIONS: detect_leaks=0
+        run: ctest --test-dir build-san --output-on-failure --timeout 300
+
+  # ---------------------------------------------------------------------------
   # 质量门禁
   # ---------------------------------------------------------------------------
   quality:
