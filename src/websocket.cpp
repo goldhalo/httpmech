@@ -24,6 +24,18 @@
 
 namespace httpmech {
 
+namespace {
+
+/// steady_clock 的纳秒计数（时间戳要放进原子量，所以统一用 int64）。
+std::int64_t now_ns() noexcept
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+} // namespace
+
 std::string make_websocket_accept(std::string_view client_key)
 {
     // RFC 6455 §1.3 的魔法字符串
@@ -97,14 +109,21 @@ WsSessionImpl::WsSessionImpl(Role role, WsIo io, WebSocketConfig cfg, WebSocketH
     , m_peer(peer)
     , m_headers_raw(std::move(handshake_headers_raw))
 {
-    m_last_rx   = std::chrono::steady_clock::now();
-    m_last_ping = m_last_rx;
+    m_last_rx_ns.store(now_ns(), std::memory_order_relaxed);
+    m_last_ping_ns.store(m_last_rx_ns.load(std::memory_order_relaxed),
+                         std::memory_order_relaxed);
 
     // 掩码用的种子：同一进程里的多个连接不该共用同一串掩码。
     // 这里只求"不重复"，不追求密码学强度（RFC 只要求不可预测到防止
     // 中间层做缓存投毒，对设备内网场景足够）。
     std::random_device rd;
-    m_rng = (static_cast<std::uint32_t>(rd()) ^ 0x9E3779B9u) | 1u;
+    m_rng.store((static_cast<std::uint32_t>(rd()) ^ 0x9E3779B9u) | 1u,
+                std::memory_order_relaxed);
+}
+
+std::size_t WsSessionImpl::pending_send_bytes() const noexcept
+{
+    return m_io.pending ? m_io.pending() : 0;
 }
 
 void WsSessionImpl::start()
@@ -116,7 +135,7 @@ void WsSessionImpl::start()
 
 bool WsSessionImpl::is_open() const noexcept
 {
-    return m_state == State::open;
+    return m_state.load(std::memory_order_acquire) == State::open;
 }
 
 std::string_view WsSessionImpl::handshake_header(std::string_view name) const noexcept
@@ -143,7 +162,7 @@ std::string_view WsSessionImpl::handshake_header(std::string_view name) const no
 bool WsSessionImpl::send_frame(std::uint8_t opcode, bool fin, span<const std::uint8_t> payload,
                                bool close_after)
 {
-    if (m_state == State::closed) {
+    if (m_state.load(std::memory_order_acquire) == State::closed) {
         return false;
     }
     std::string wire;
@@ -152,10 +171,8 @@ bool WsSessionImpl::send_frame(std::uint8_t opcode, bool fin, span<const std::ui
     std::uint8_t mask[4] = {0, 0, 0, 0};
     if (m_role == Role::client) {
         // xorshift：够用且无依赖
-        m_rng ^= m_rng << 13;
-        m_rng ^= m_rng >> 17;
-        m_rng ^= m_rng << 5;
-        const std::uint32_t k = m_rng;
+        // 原子递增取数：掩码只要求"每帧不同"，不要求密码学强度。
+        const std::uint32_t k = m_rng.fetch_add(0x9E3779B9u, std::memory_order_relaxed);
         mask[0] = static_cast<std::uint8_t>((k >> 24) & 0xFF);
         mask[1] = static_cast<std::uint8_t>((k >> 16) & 0xFF);
         mask[2] = static_cast<std::uint8_t>((k >> 8) & 0xFF);
@@ -164,17 +181,18 @@ bool WsSessionImpl::send_frame(std::uint8_t opcode, bool fin, span<const std::ui
     append_frame(wire, opcode, fin, payload.data(), payload.size(),
                  (m_role == Role::client) ? mask : nullptr);
 
-    m_pending_out += wire.size();
     const bool ok = m_io.send ? m_io.send(std::move(wire), close_after) : false;
     if (!ok) {
-        m_state = State::closed;
+        // 未受理（已关闭 / netmech 反压）。**不在这里假装连接已死**：
+        // 反压是正常状态，调用方看返回值决定重试还是放弃。
+        return false;
     }
-    return ok;
+    return true;
 }
 
 bool WsSessionImpl::send_text(std::string_view text)
 {
-    if (m_cfg.max_send_queue_bytes != 0 && m_pending_out > m_cfg.max_send_queue_bytes) {
+    if (m_cfg.max_send_queue_bytes != 0 && pending_send_bytes() > m_cfg.max_send_queue_bytes) {
         return false;   // 背压：队列已经堆满，交给应用自己决定丢弃还是等
     }
     return send_frame(kOpText, true,
@@ -184,7 +202,7 @@ bool WsSessionImpl::send_text(std::string_view text)
 
 bool WsSessionImpl::send_binary(span<const std::uint8_t> data)
 {
-    if (m_cfg.max_send_queue_bytes != 0 && m_pending_out > m_cfg.max_send_queue_bytes) {
+    if (m_cfg.max_send_queue_bytes != 0 && pending_send_bytes() > m_cfg.max_send_queue_bytes) {
         return false;
     }
     return send_frame(kOpBinary, true, data);
@@ -200,11 +218,14 @@ bool WsSessionImpl::send_ping(span<const std::uint8_t> payload)
 
 void WsSessionImpl::close(std::uint16_t code, std::string_view reason)
 {
-    if (m_state != State::open || m_close_sent) {
+    if (m_state.load(std::memory_order_acquire) != State::open) {
         return;
     }
-    m_close_sent = true;
-    m_state      = State::closing;
+    bool expected = false;
+    if (!m_close_sent.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        return;   // 别人已经在关了
+    }
+    m_state.store(State::closing, std::memory_order_release);
 
     std::string payload;
     payload.push_back(static_cast<char>((code >> 8) & 0xFF));
@@ -216,14 +237,13 @@ void WsSessionImpl::close(std::uint16_t code, std::string_view reason)
     send_frame(kOpClose, true,
                span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(payload.data()),
                                         payload.size()});
-    m_close_deadline     = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    m_close_deadline_set = true;
+    m_close_deadline_ns.store(now_ns() + 2'000'000'000LL, std::memory_order_release);
 }
 
 void WsSessionImpl::protocol_error(std::uint16_t code, std::string_view why)
 {
     close(code, why);
-    m_state = State::closed;
+    m_state.store(State::closed, std::memory_order_release);
     if (m_io.close) {
         m_io.close();
     }
@@ -231,11 +251,11 @@ void WsSessionImpl::protocol_error(std::uint16_t code, std::string_view why)
 
 void WsSessionImpl::on_bytes(span<const std::uint8_t> data)
 {
-    if (m_state == State::closed) {
+    if (m_state.load(std::memory_order_acquire) == State::closed) {
         return;
     }
     m_in.append(reinterpret_cast<const char*>(data.data()), data.size());
-    m_last_rx = std::chrono::steady_clock::now();
+    m_last_rx_ns.store(now_ns(), std::memory_order_relaxed);
 
     for (;;) {
         const std::size_t before = m_in.size();
@@ -248,7 +268,7 @@ void WsSessionImpl::on_bytes(span<const std::uint8_t> data)
         if (m_in.size() == before) {
             break;   // 没有进展：数据不够一帧
         }
-        if (m_state == State::closed) {
+        if (m_state.load(std::memory_order_acquire) == State::closed) {
             return;
         }
     }
@@ -349,8 +369,9 @@ void WsSessionImpl::feed_one_frame(std::error_code& ec)
         }
         // 回一帧 close 再断。（若我们之前已经主动发过 close，就只剩等对端这一帧。）
         bool echoed = false;
-        if (!m_close_sent) {
-            m_close_sent = true;
+        bool expected_unused = false;
+        if (m_close_sent.compare_exchange_strong(expected_unused, true,
+                                                std::memory_order_acq_rel)) {
             std::string echo;
             echo.push_back(data.size() >= 2 ? data[0] : static_cast<char>(0x03));
             echo.push_back(data.size() >= 2 ? data[1] : static_cast<char>(0xE8));   // 1000
@@ -365,7 +386,7 @@ void WsSessionImpl::feed_one_frame(std::error_code& ec)
         if (m_handlers.on_close) {
             m_handlers.on_close(*this, report, why);
         }
-        m_state = State::closed;
+        m_state.store(State::closed, std::memory_order_release);
         // 刚回过 close 的情况：那一帧是 close_after=true 排进队列的，
         // **不能**再调 io.close() —— 会把还没写出去的 close 帧一起丢掉，
         // 对端只能看到 TCP 被掐断（RFC 6455 里这叫 abnormal closure）。
@@ -437,13 +458,18 @@ void WsSessionImpl::deliver_message(std::string&& payload, bool is_text)
 
 void WsSessionImpl::tick(std::chrono::steady_clock::time_point now)
 {
-    if (m_state == State::closed) {
+    // 注意：tick 跑在**服务器的 sweeper 线程**上，而 on_bytes/on_write 在 io 线程。
+    // 所以这里读写的每个字段都是原子量；真正发帧那一步走的是线程安全的 send 路径。
+    if (m_state.load(std::memory_order_acquire) == State::closed) {
         return;
     }
+    const std::int64_t now_ns_v =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
 
     // 关闭握手的兜底：发了 close 但对方不回，2 秒后强关
-    if (m_close_deadline_set && now >= m_close_deadline) {
-        m_state = State::closed;
+    const std::int64_t dl = m_close_deadline_ns.load(std::memory_order_acquire);
+    if (dl != 0 && now_ns_v >= dl) {
+        m_state.store(State::closed, std::memory_order_release);
         if (m_io.close) {
             m_io.close();
         }
@@ -451,9 +477,12 @@ void WsSessionImpl::tick(std::chrono::steady_clock::time_point now)
     }
 
     // 空闲超时
-    if (m_cfg.idle_timeout.count() > 0 && now - m_last_rx > m_cfg.idle_timeout) {
+    const auto idle_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             m_cfg.idle_timeout).count();
+    if (idle_ns > 0 &&
+        now_ns_v - m_last_rx_ns.load(std::memory_order_relaxed) > idle_ns) {
         close(static_cast<std::uint16_t>(WsCloseCode::going_away), "idle timeout");
-        m_state = State::closed;
+        m_state.store(State::closed, std::memory_order_release);
         if (m_io.close) {
             m_io.close();
         }
@@ -461,18 +490,20 @@ void WsSessionImpl::tick(std::chrono::steady_clock::time_point now)
     }
 
     // 主动 ping 保活
-    if (m_cfg.ping_interval.count() > 0 && now - m_last_ping >= m_cfg.ping_interval) {
-        m_last_ping = now;
+    const auto ping_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             m_cfg.ping_interval).count();
+    if (ping_ns > 0 &&
+        now_ns_v - m_last_ping_ns.load(std::memory_order_relaxed) >= ping_ns) {
+        m_last_ping_ns.store(now_ns_v, std::memory_order_relaxed);
         send_frame(kOpPing, true, {});
     }
 }
 
 void WsSessionImpl::on_transport_closed()
 {
-    if (m_state == State::closed) {
+    if (m_state.exchange(State::closed, std::memory_order_acq_rel) == State::closed) {
         return;
     }
-    m_state = State::closed;
     if (m_handlers.on_close) {
         m_handlers.on_close(*this, static_cast<std::uint16_t>(WsCloseCode::abnormal), "transport closed");
     }

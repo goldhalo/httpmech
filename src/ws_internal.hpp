@@ -7,6 +7,7 @@
 // =============================================================================
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -25,6 +26,8 @@ struct WsIo {
     std::function<bool(std::string, bool)> send;
     /// 立刻关闭底层传输（不优雅）。
     std::function<void()> close;
+    /// 已受理但还没写完的字节数（背压判据）。
+    std::function<std::size_t()> pending;
 };
 
 class WsSessionImpl : public WebSocketSession,
@@ -59,7 +62,7 @@ public:
     [[nodiscard]] std::string_view     real_ip() const noexcept override { return m_real_ip; }
     [[nodiscard]] std::string_view     path() const noexcept override { return m_path; }
     [[nodiscard]] std::string_view     handshake_header(std::string_view name) const noexcept override;
-    [[nodiscard]] std::size_t          pending_send_bytes() const noexcept override { return m_pending_out; }
+    [[nodiscard]] std::size_t          pending_send_bytes() const noexcept override;
     [[nodiscard]] std::uint64_t        messages_received() const noexcept override { return m_recv_msgs; }
 
     // --- 供 ServerSession 驱动 ---
@@ -99,17 +102,19 @@ private:
     bool                 m_msg_is_text = false;
     bool                 m_in_fragment = false;
 
-    State                m_state = State::open;
-    bool                 m_close_sent = false;
-    std::size_t          m_pending_out = 0;
+    // 下面这几个字段会被**两个线程**碰：io 线程（读写回调）与服务器的
+    // sweeper 线程（tick → 自动 ping / 空闲超时）。send_*() 还可能来自应用线程。
+    // 所以一律用原子量，而不是"靠调用方保证单线程"。
+    std::atomic<State>   m_state{State::open};
+    std::atomic<bool>    m_close_sent{false};
     std::uint64_t        m_recv_msgs = 0;
 
-    std::uint32_t                      m_rng = 0x9E3779B9u;   ///< 客户端掩码用的 PRNG
+    std::atomic<std::uint32_t>         m_rng{0x9E3779B9u};    ///< 客户端掩码（原子递增取数）
 
-    std::chrono::steady_clock::time_point m_last_rx;
-    std::chrono::steady_clock::time_point m_last_ping;
-    std::chrono::steady_clock::time_point m_close_deadline;
-    bool                                  m_close_deadline_set = false;
+    // 时间戳统一存成 steady_clock 的纳秒计数（int64），才能放进原子量。
+    std::atomic<std::int64_t> m_last_rx_ns{0};
+    std::atomic<std::int64_t> m_last_ping_ns{0};
+    std::atomic<std::int64_t> m_close_deadline_ns{0};   ///< 0 = 未设置
 };
 
 } // namespace detail

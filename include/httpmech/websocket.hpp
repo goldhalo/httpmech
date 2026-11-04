@@ -99,7 +99,14 @@ struct WebSocketConfig {
 ///
 /// @par 线程
 /// 回调在**该连接的 io 线程**上串行执行（与 HTTP 一致）。
-/// `send_*()` 可在任意线程调用（内部投递到 io 线程）。
+///
+/// `send_*()` 可以在**任意线程**调用：本层不持有任何非原子状态，帧的字节顺序
+/// 由底层 FIFO 发送队列保证（一帧 = 一次 write，不会交错）。库自己的自动 ping
+/// 由服务器的定时线程（sweeper）发起，`pong`/`close` 由 io 线程发起 ——
+/// 三者走的是同一条路径，不需要调用方额外加锁。
+///
+/// @note 返回 false 表示"这一帧**没被受理**"（连接已关 / 底层反压），
+///       不是错误、也不代表连接断了；要不要重试由调用方决定。
 class WebSocketSession {
 public:
     virtual ~WebSocketSession() = default;

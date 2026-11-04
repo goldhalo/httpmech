@@ -177,10 +177,10 @@ public:
         if (m_closed.load(std::memory_order_relaxed)) {
             return;
         }
-        if (m_close_after_write) {
-            // 有"写完就关"的报文在队列里：**不能在这里关**，
+        if (m_close_after_all.load(std::memory_order_acquire)) {
+            // 有"写完就关"的报文在途：**不能在这里关**，
             // 否则那帧还没写出去就被掐断（WS 的 close 帧就栽在这上面）。
-            // 交给 on_write：写完成后由它收尾。
+            // 交给 on_write：全部落地后由它收尾。
             return;
         }
         if (!start_read()) {
@@ -188,15 +188,17 @@ public:
         }
     }
 
-    void on_write(std::error_code ec, netmech::ConstBuf /*buf*/, std::size_t /*n*/) override
+    void on_write(std::error_code ec, netmech::ConstBuf buf, std::size_t /*n*/) override
     {
-        m_pending_writes.pop_front();
+        m_inflight_bytes.fetch_sub(buf.size, std::memory_order_acq_rel);
+        const auto left = m_inflight.fetch_sub(1, std::memory_order_acq_rel) - 1;
         if (ec) {
             close_now();
             return;
         }
-        // "写完就关"的报文已经落地，现在才真正关连接
-        if (m_close_after_write) {
+        // "写完就关"：必须等**所有**已受理的写都落地。
+        // 早先这是个 bool 标志 + 队列，谁先完成谁就关 —— close 帧排在别人后面时会被吞掉。
+        if (left == 0 && m_close_after_all.load(std::memory_order_acquire)) {
             close_now();
         }
     }
@@ -206,7 +208,10 @@ public:
         if (m_ws) {
             m_ws->on_transport_closed();
         }
-        m_conn.reset();
+        {
+            std::lock_guard<std::mutex> lk(m_conn_mu);
+            m_conn.reset();
+        }
         if (!m_closed.exchange(true)) {
             m_owner->conns.fetch_sub(1, std::memory_order_relaxed);
         }
@@ -232,16 +237,19 @@ public:
 
     // --- ResponseWriter / WebSocket 调用 ---
 
-    void send(std::string wire, bool close_after);
+    /// @return false 表示未受理（已关闭 / 反压），调用方自行决定后续动作。
+    bool send(std::string wire, bool close_after);
+
+    /// 已受理但未写完的字节数（WS 层拿它做背压判据）。
+    std::size_t inflight_bytes() const noexcept
+    {
+        return m_inflight_bytes.load(std::memory_order_relaxed);
+    }
 
     /// 帧层发原始字节。返回 false 表示连接已不可写。
     bool send_bytes(std::string wire, bool close_after)
     {
-        if (!m_conn || m_closed.load(std::memory_order_relaxed)) {
-            return false;
-        }
-        send(std::move(wire), close_after);
-        return !m_closed.load(std::memory_order_relaxed);
+        return send(std::move(wire), close_after);
     }
 
     /// 升级为 WebSocket：建帧层会话并回调 on_open。
@@ -255,9 +263,23 @@ public:
         if (m_closed.exchange(true)) {
             return;
         }
-        if (auto c = m_conn) {
+        // 锁内只取 shared_ptr，**不在持锁时调 close()** ——
+        // close() 可能同步回调到 on_close，on_close 又要拿这把锁。
+        std::shared_ptr<netmech::Conn> c;
+        {
+            std::lock_guard<std::mutex> lk(m_conn_mu);
+            c = m_conn;
+        }
+        if (c) {
             c->close();
         }
+    }
+
+    /// 锁内取一份 m_conn，供发送路径使用。
+    std::shared_ptr<netmech::Conn> conn_snapshot() const
+    {
+        std::lock_guard<std::mutex> lk(m_conn_mu);
+        return m_conn;
     }
 
 private:
@@ -292,11 +314,18 @@ private:
     std::shared_ptr<detail::WsSessionImpl>      m_ws;
 
     std::shared_ptr<std::vector<char>>       m_read_buf;
-    std::deque<std::shared_ptr<std::string>> m_pending_writes;   // 保活到写完成
+    // 发送路径可以被多个线程同时进入（应用的 send_*()、sweeper 线程的自动 ping）。
+    // 所以这里**不留任何非原子簿记**：
+    //   · 缓冲的存活由 netmech 的 ConstBuf::owner 负责，本层不持有队列；
+    //   · 在途笔数用原子计数，"写完就关"用原子标志 + 计数归零判定。
+    mutable std::mutex        m_conn_mu;                          // 保护 m_conn 的读写
+    std::atomic<std::size_t>  m_inflight{0};                      // 已受理、未回调的写笔数
+    std::atomic<std::size_t>  m_inflight_bytes{0};                // 同一批的字节总数（背压判据）
+    std::atomic<bool>         m_close_after_all{false};           // 全部落地后关闭
 
     std::atomic<bool> m_closed{false};
     bool              m_stream_headers_done = false;
-    bool              m_close_after_write = false;
+
     bool              m_busy              = false;
     std::uint64_t     m_served            = 0;
 
@@ -437,7 +466,8 @@ void ServerSession::pump()
                 // 后面的字节全部交给帧层（on_read 里分流）。
                 return;
             }
-            if (m_closed.load(std::memory_order_relaxed) || m_close_after_write) {
+            if (m_closed.load(std::memory_order_relaxed) ||
+                m_close_after_all.load(std::memory_order_acquire)) {
                 return;
             }
             break;
@@ -452,7 +482,8 @@ void ServerSession::pump()
 
         case httpmech::Parser::Result::message_end:
             dispatch_stream_events({}, true);
-            if (m_closed.load(std::memory_order_relaxed) || m_close_after_write) {
+            if (m_closed.load(std::memory_order_relaxed) ||
+                m_close_after_all.load(std::memory_order_acquire)) {
                 return;
             }
             break;
@@ -591,7 +622,9 @@ void ServerSession::finish_writer(bool keep_alive)
         wire.append(m_writer.body);
     }
 
-    send(std::move(wire), !ka);
+    if (!send(std::move(wire), !ka)) {
+        close_now();   // 响应发不出去（对端已断 / 反压）：关掉，别让客户端干等
+    }
 
     // 为下一条请求做准备（keep-alive）。升级成 WebSocket 之后不适用。
     if (ka && !m_is_ws) {
@@ -605,7 +638,7 @@ bool ServerSession::switch_to_websocket(WebSocketHandlers handlers, WebSocketCon
                                         std::string path, std::string real_ip,
                                         std::string headers_raw)
 {
-    if (m_is_ws || !m_conn) {
+    if (m_is_ws || !conn_snapshot()) {
         return false;
     }
 
@@ -623,6 +656,12 @@ bool ServerSession::switch_to_websocket(WebSocketHandlers handlers, WebSocketCon
             self->close_now();
         }
     };
+    io.pending = [weak]() -> std::size_t {
+        if (auto self = weak.lock()) {
+            return self->inflight_bytes();
+        }
+        return 0;
+    };
 
     m_ws = std::make_shared<detail::WsSessionImpl>(
         detail::WsSessionImpl::Role::server, std::move(io), std::move(wcfg),
@@ -636,10 +675,11 @@ bool ServerSession::switch_to_websocket(WebSocketHandlers handlers, WebSocketCon
     return true;
 }
 
-void ServerSession::send(std::string wire, bool close_after)
+bool ServerSession::send(std::string wire, bool close_after)
 {
-    if (!m_conn || m_closed.load(std::memory_order_relaxed)) {
-        return;
+    auto c = conn_snapshot();
+    if (!c || m_closed.load(std::memory_order_acquire)) {
+        return false;
     }
     auto payload = std::make_shared<std::string>(std::move(wire));
     netmech::ConstBuf cb;
@@ -647,14 +687,24 @@ void ServerSession::send(std::string wire, bool close_after)
     cb.data  = payload->data();
     cb.size  = payload->size();
 
-    m_pending_writes.push_back(payload);
-    if (!m_conn->write(cb)) {
-        close_now();
-        return;
-    }
+    // 登记必须在发起之前：否则写可能在登记前完成，on_write 把计数减成负数。
+    m_inflight.fetch_add(1, std::memory_order_acq_rel);
+    m_inflight_bytes.fetch_add(cb.size, std::memory_order_acq_rel);
     if (close_after) {
-        m_close_after_write = true;
+        m_close_after_all.store(true, std::memory_order_release);
     }
+
+    if (!c->write(cb)) {
+        // netmech 的 false 有"反压"这种正常情况（**不断链**），
+        // 所以这里不再 close_now()，把结果如实交给调用方。
+        m_inflight_bytes.fetch_sub(cb.size, std::memory_order_acq_rel);
+        const auto left = m_inflight.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (close_after && left == 0) {
+            close_now();   // 想关却没发出去，也不能挂着
+        }
+        return false;
+    }
+    return true;
 }
 
 // =============================================================================
