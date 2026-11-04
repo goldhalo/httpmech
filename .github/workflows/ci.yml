@@ -110,9 +110,9 @@ jobs:
           $code = $LASTEXITCODE
           Write-Host $out
           if ($code -ne 0) {
-            $line = ($out -split "`r?`n" | Where-Object { $_ -match 'CMake Error|error' } | Select-Object -First 1)
-            if (-not $line) { $line = (($out -split "`r?`n") | Select-Object -Last 3) -join ' | ' }
-            Write-Host "::error title=Windows configure failed::$line"
+            $errs = ($out -split "`r?`n" | Where-Object { $_ -match 'CMake Error' } | Select-Object -First 3) -join ' | '
+            if (-not $errs) { $errs = (($out -split "`r?`n") | Where-Object { $_.Trim() -ne '' } | Select-Object -Last 5) -join ' | ' }
+            Write-Host "::error title=Windows configure failed::$errs"
             exit 1
           }
 
@@ -229,9 +229,17 @@ jobs:
 
       - name: 检查不得引入 Boost / OpenSSL
         run: |
-          if grep -rn -e 'boost::' -e 'openssl/' include/ src/ example/ test/ \
-               --include='*.hpp' --include='*.cpp' | grep -v '^\s*//'; then
-            echo "❌ 发现 boost:: 或 openssl 引用（本库零外部依赖）"
+          # 只看 #include：注释里提到 boost::beast 是在讲"我们为什么不用它"，
+          # 不该算依赖（之前这条因为注释里的 boost:: 误报过一次）。
+          if grep -rnE '^[[:space:]]*#[[:space:]]*include[[:space:]]*<(boost|openssl)/' \
+               include/ src/ example/ test/ --include='*.hpp' --include='*.cpp'; then
+            echo "❌ 发现有 boost / openssl 的 #include（本库零外部依赖）"
+            exit 1
+          fi
+          # 顺带拦住 netmech 之外的第二份 asio（我们自己用的那份在 netmech 里）
+          if grep -rnE '^[[:space:]]*#[[:space:]]*include[[:space:]]*<(asio|asio\.hpp)' \
+               include/ src/ example/ --include='*.hpp' --include='*.cpp'; then
+            echo "❌ 发现直接 #include asio（应通过 netmech 的头间接使用）"
             exit 1
           fi
           echo "✅ 无 Boost / OpenSSL 依赖"
