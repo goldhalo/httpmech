@@ -44,7 +44,9 @@ jobs:
           if [ "${{ matrix.compiler }}" = "gcc" ]; then
             sudo apt-get install -y g++
           else
-            sudo apt-get install -y clang++
+            # 用 runner 预装的 clang：apt 装 clang++ 常因版本被钉死而失败
+            # （clang++ : Depends: clang (= 1:14.0-...) but 1:18.x is to be installed）
+            clang++ --version || { echo "::error::runner 上没有预装 clang++"; exit 1; }
           fi
 
       - name: 配置
@@ -97,15 +99,35 @@ jobs:
           repository: goldhalo/netmech
           path: netmech
 
+      # 说明：把 cmake 的输出抓下来，失败时用 ::error:: 打到 annotation 上。
+      # 原因：Actions 的原始日志要通过 API 取需要仓库管理员权限，
+      # 而 annotation 是公开可读的 —— 排查 CI 失败时这点很关键。
       - name: 配置
         working-directory: httpmech
-        run: >
-          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
-          -DHTTPMECH_WARNINGS_AS_ERRORS=ON
+        shell: pwsh
+        run: |
+          $out  = cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DHTTPMECH_WARNINGS_AS_ERRORS=ON 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $out
+          if ($code -ne 0) {
+            $line = ($out -split "`r?`n" | Where-Object { $_ -match 'CMake Error|error' } | Select-Object -First 1)
+            if (-not $line) { $line = (($out -split "`r?`n") | Select-Object -Last 3) -join ' | ' }
+            Write-Host "::error title=Windows configure failed::$line"
+            exit 1
+          }
 
       - name: 构建
         working-directory: httpmech
-        run: cmake --build build --config ${{ matrix.build_type }} --parallel
+        shell: pwsh
+        run: |
+          $out  = cmake --build build --config ${{ matrix.build_type }} --parallel 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $out
+          if ($code -ne 0) {
+            $line = ($out -split "`r?`n" | Where-Object { $_ -match 'error|: fatal' } | Select-Object -First 2) -join ' | '
+            Write-Host "::error title=Windows build failed::$line"
+            exit 1
+          }
 
       - name: 测试
         working-directory: httpmech
@@ -190,11 +212,15 @@ jobs:
       - name: 检查禁止的 C++20 特性
         run: |
           FAIL=0
+          # 只看代码，跳过纯注释行（span.hpp 的说明里就提到过 std::span）
           for pat in 'co_await' 'co_return' 'co_yield' 'std::span' 'std::format' \
                      'std::jthread' 'std::atomic_ref' '\bconcept\b' '\branges::' '<=>'; do
-            if grep -rEn "$pat" include/ src/ example/ test/ \
-                 --include='*.hpp' --include='*.cpp' 2>/dev/null; then
+            hits=$(grep -rEn "$pat" include/ src/ example/ test/ \
+                     --include='*.hpp' --include='*.cpp' 2>/dev/null \
+                   | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)
+            if [ -n "$hits" ]; then
               echo "❌ 发现禁止的构造: $pat"
+              echo "$hits"
               FAIL=1
             fi
           done

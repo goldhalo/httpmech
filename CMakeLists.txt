@@ -79,14 +79,14 @@ message(STATUS "httpmech: netmech @ ${HTTPMECH_NETMECH_DIR}")
 # 4. 编译选项
 # ---------------------------------------------------------------------------
 add_library(httpmech_compile_options INTERFACE)
+# 注意：genex 里的多个选项必须用 ';' 分隔，不能靠空格 ——
+#   写成 "a b" 时，Makefile/Ninja 生成器把选项拼成命令行会"恰好"变成两个参数，
+#   但 VS 生成器是按字符串原样塞进 AdditionalOptions，行为不一致。
 target_compile_options(httpmech_compile_options INTERFACE
-    $<$<COMPILE_LANGUAGE:CXX>:
-        $<$<CXX_COMPILER_ID:MSVC>:/utf-8 /W4 /permissive- /Zc:__cplusplus>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra>>
-    $<$<COMPILE_LANGUAGE:C>:
-        $<$<C_COMPILER_ID:MSVC>:/utf-8 /W3>
-        $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wall -Wextra>>
-)
+    $<$<COMPILE_LANGUAGE:CXX>:$<$<CXX_COMPILER_ID:MSVC>:/utf-8;/W4;/permissive-;/Zc:__cplusplus>>
+    $<$<COMPILE_LANGUAGE:CXX>:$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall;-Wextra>>
+    $<$<COMPILE_LANGUAGE:C>:$<$<C_COMPILER_ID:MSVC>:/utf-8;/W3>>
+    $<$<COMPILE_LANGUAGE:C>:$<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wall;-Wextra>>)
 if(HTTPMECH_WARNINGS_AS_ERRORS)
     target_compile_options(httpmech_compile_options INTERFACE
         $<$<CXX_COMPILER_ID:MSVC>:/WX>
