@@ -14,7 +14,7 @@ TLS、HTTP/2、静态文件都交给前面的 nginx，本库只处理它转过�
   （链接仍需要 `libnetmech.a`，见下方"依赖"）
 - 自带路由、before/after 钩子、WebSocket（握手 + 帧层），**零外部依赖**
 - C++17，不引 Boost / OpenSSL；WebSocket 握手用的 SHA-1 + Base64 也是自带的
-- 212 个断言（单元 + 端到端），CI 覆盖 Linux（gcc/clang × Debug/Release）与 Windows MSVC
+- 单元 + 端到端测试，CI 覆盖 Linux（gcc/clang × Debug/Release）与 Windows MSVC
 
 ---
 
