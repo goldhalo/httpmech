@@ -34,6 +34,13 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <string_view>
+#include <memory>
+#include <vector>
+#include <cstddef>
+#include <cstdint>
+#include <system_error>
+#include <utility>
 
 namespace httpmech {
 

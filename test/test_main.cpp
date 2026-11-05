@@ -14,6 +14,12 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <string_view>
+#include <mutex>
+#include <cstddef>
+#include <cstdint>
+#include <system_error>
+#include <utility>
 
 #if defined(_WIN32)
 #    include <windows.h>

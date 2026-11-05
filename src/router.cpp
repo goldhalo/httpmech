@@ -4,6 +4,11 @@
 #include <httpmech/router.hpp>
 
 #include <chrono>
+#include <string_view>
+#include <vector>
+#include <cstddef>
+#include <string>
+#include <utility>
 
 namespace httpmech {
 

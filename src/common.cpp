@@ -4,6 +4,9 @@
 #include <httpmech/common.hpp>
 
 #include <string>
+#include <string_view>
+#include <cstdint>
+#include <system_error>
 
 namespace httpmech {
 

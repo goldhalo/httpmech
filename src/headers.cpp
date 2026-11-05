@@ -3,6 +3,10 @@
 // =============================================================================
 #include <httpmech/headers.hpp>
 
+#include <string_view>
+#include <cstddef>
+#include <string>
+
 namespace httpmech {
 
 static inline unsigned char lower(unsigned char c) noexcept

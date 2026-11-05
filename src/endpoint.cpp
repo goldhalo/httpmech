@@ -10,6 +10,10 @@
 
 #include <netmech/common.hpp>
 
+#include <optional>
+#include <string_view>
+#include <string>
+
 namespace httpmech {
 
 std::optional<Endpoint> Endpoint::parse(std::string_view text) noexcept

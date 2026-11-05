@@ -16,6 +16,10 @@
 #include <cstdlib>
 #include <string>
 #include <thread>
+#include <string_view>
+#include <memory>
+#include <cstdint>
+#include <utility>
 
 int main(int argc, char** argv)
 {

@@ -13,6 +13,9 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <cstddef>
+#include <system_error>
 
 #include <httpmech/endpoint.hpp>
 #include <httpmech/websocket.hpp>

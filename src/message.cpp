@@ -4,6 +4,10 @@
 #include <httpmech/message.hpp>
 
 #include <cstdlib>
+#include <optional>
+#include <string_view>
+#include <cstddef>
+#include <cstdint>
 
 namespace httpmech {
 

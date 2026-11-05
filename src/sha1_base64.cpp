@@ -7,6 +7,11 @@
 #include "sha1_base64.hpp"
 
 #include <cstring>
+#include <array>
+#include <string_view>
+#include <cstddef>
+#include <cstdint>
+#include <string>
 
 namespace httpmech {
 namespace detail {
