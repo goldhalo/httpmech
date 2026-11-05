@@ -240,6 +240,9 @@ public:
     /// @return false 表示未受理（已关闭 / 反压），调用方自行决定后续动作。
     bool send(std::string wire, bool close_after);
 
+    /// 传输是否已经关死（WS 层靠它区分"反压"和"连接没了"）。
+    bool closed_flag() const noexcept { return m_closed.load(std::memory_order_acquire); }
+
     /// 已受理但未写完的字节数（WS 层拿它做背压判据）。
     std::size_t inflight_bytes() const noexcept
     {
@@ -661,6 +664,12 @@ bool ServerSession::switch_to_websocket(WebSocketHandlers handlers, WebSocketCon
             return self->inflight_bytes();
         }
         return 0;
+    };
+    io.is_closed = [weak]() -> bool {
+        if (auto self = weak.lock()) {
+            return self->closed_flag();
+        }
+        return true;   // 会话没了就等于关
     };
 
     m_ws = std::make_shared<detail::WsSessionImpl>(

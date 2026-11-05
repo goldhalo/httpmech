@@ -59,6 +59,9 @@ constexpr std::uint8_t kOpClose  = 0x8;
 constexpr std::uint8_t kOpPing   = 0x9;
 constexpr std::uint8_t kOpPong   = 0xA;
 
+/// close code：协议错误（RFC 6455 §7.4.1 定义的 1002）。
+constexpr std::uint16_t kCloseProtocolError = 1002;
+
 /// 追加一帧（服务端发出的帧**不打掩码**）。
 void append_frame(std::string& out, std::uint8_t opcode, bool fin,
                   const std::uint8_t* payload, std::size_t len,
@@ -183,8 +186,12 @@ bool WsSessionImpl::send_frame(std::uint8_t opcode, bool fin, span<const std::ui
 
     const bool ok = m_io.send ? m_io.send(std::move(wire), close_after) : false;
     if (!ok) {
-        // 未受理（已关闭 / netmech 反压）。**不在这里假装连接已死**：
-        // 反压是正常状态，调用方看返回值决定重试还是放弃。
+        // 两种可能：底层反压（正常，重试即可），或者传输已经关死了。
+        // 后者必须走完整的关闭流程 —— 否则应用永远等不到 on_close，
+        // 只能看着 is_open() 变 false 却不知道发生了什么。
+        if (m_io.is_closed && m_io.is_closed()) {
+            fail_transport();
+        }
         return false;
     }
     return true;
@@ -195,6 +202,9 @@ bool WsSessionImpl::send_text(std::string_view text)
     if (m_cfg.max_send_queue_bytes != 0 && pending_send_bytes() > m_cfg.max_send_queue_bytes) {
         return false;   // 背压：队列已经堆满，交给应用自己决定丢弃还是等
     }
+    if (m_cfg.max_frame_bytes != 0 && text.size() > m_cfg.max_frame_bytes) {
+        return false;   // 单帧超限：我们不做发送侧分片，超了就是发不了
+    }
     return send_frame(kOpText, true,
                       span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(text.data()),
                                                text.size()});
@@ -204,6 +214,9 @@ bool WsSessionImpl::send_binary(span<const std::uint8_t> data)
 {
     if (m_cfg.max_send_queue_bytes != 0 && pending_send_bytes() > m_cfg.max_send_queue_bytes) {
         return false;
+    }
+    if (m_cfg.max_frame_bytes != 0 && data.size() > m_cfg.max_frame_bytes) {
+        return false;   // 同上：超单帧上限
     }
     return send_frame(kOpBinary, true, data);
 }
@@ -234,10 +247,31 @@ void WsSessionImpl::close(std::uint16_t code, std::string_view reason)
     payload.append(reason.data(), take);
 
     // 先发 close 帧，等对端回帧（tick 里超时兜底）
-    send_frame(kOpClose, true,
-               span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(payload.data()),
-                                        payload.size()});
+    const bool sent = send_frame(
+        kOpClose, true,
+        span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(payload.data()),
+                                 payload.size()});
+    if (!sent) {
+        // close 帧根本没发出去：握手已经不可能完成，直接断，别让应用干等 2 秒。
+        fail_transport();
+        return;
+    }
     m_close_deadline_ns.store(now_ns() + 2'000'000'000LL, std::memory_order_release);
+}
+
+void WsSessionImpl::fail_transport()
+{
+    // 与 on_transport_closed() 共用同一道闸：谁先到谁负责通知，另一个直接返回。
+    if (m_state.exchange(State::closed, std::memory_order_acq_rel) == State::closed) {
+        return;
+    }
+    if (m_handlers.on_close) {
+        m_handlers.on_close(*this, static_cast<std::uint16_t>(WsCloseCode::abnormal),
+                            "transport lost");
+    }
+    if (m_io.close) {
+        m_io.close();
+    }
 }
 
 void WsSessionImpl::protocol_error(std::uint16_t code, std::string_view why)
@@ -360,11 +394,25 @@ void WsSessionImpl::feed_one_frame(std::error_code& ec)
         return;   // 只用于刷新 m_last_rx（上面已刷）
 
     case kOpClose: {
+        // RFC 6455 §5.5.1：close 帧载荷要么空，要么 ≥2 字节（2 字节 code + 可选 reason）。
+        if (data.size() == 1) {
+            protocol_error(kCloseProtocolError, "close 帧载荷只有 1 字节");
+            return;
+        }
         std::uint16_t code = static_cast<std::uint16_t>(WsCloseCode::no_status);
         std::string   why;
         if (data.size() >= 2) {
             code = static_cast<std::uint16_t>((static_cast<std::uint8_t>(data[0]) << 8) |
                                               static_cast<std::uint8_t>(data[1]));
+            // 1005/1006/1015 是"本地状态"用值，**不允许出现在线路上**；
+            // 1004 保留、1012-1014 未定义。收到这些只能按协议错误处理。
+            const bool valid = (code >= 1000 && code <= 1003) ||
+                               (code >= 1007 && code <= 1011) ||
+                               (code >= 3000 && code <= 4999);
+            if (!valid) {
+                protocol_error(kCloseProtocolError, "close code 非法");
+                return;
+            }
             why.assign(data.data() + 2, data.size() - 2);
         }
         // 回一帧 close 再断。（若我们之前已经主动发过 close，就只剩等对端这一帧。）

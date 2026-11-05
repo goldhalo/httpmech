@@ -28,6 +28,8 @@ struct WsIo {
     std::function<void()> close;
     /// 已受理但还没写完的字节数（背压判据）。
     std::function<std::size_t()> pending;
+    /// 底层传输是否已经关死（用来区分"反压"和"连接没了"）。
+    std::function<bool()> is_closed;
 };
 
 class WsSessionImpl : public WebSocketSession,
@@ -86,6 +88,9 @@ private:
     void        deliver_message(std::string&& payload, bool is_text);
     bool        send_frame(std::uint8_t opcode, bool fin, span<const std::uint8_t> payload,
                            bool close_after = false);
+    /// 传输层已经不可用：通知应用一次 on_close，然后关干净。
+    void        fail_transport();
+
     void        protocol_error(std::uint16_t code, std::string_view why);
 
     Role                               m_role;
