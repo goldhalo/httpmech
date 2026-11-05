@@ -68,7 +68,10 @@ public:
     [[nodiscard]] std::string_view     path() const noexcept override { return m_path; }
     [[nodiscard]] std::string_view     handshake_header(std::string_view name) const noexcept override;
     [[nodiscard]] std::size_t          pending_send_bytes() const noexcept override;
-    [[nodiscard]] std::uint64_t        messages_received() const noexcept override { return m_recv_msgs; }
+    [[nodiscard]] std::uint64_t        messages_received() const noexcept override
+    {
+        return m_recv_msgs.load(std::memory_order_relaxed);
+    }
 
     // --- 供 ServerSession 驱动 ---
 
@@ -115,7 +118,8 @@ private:
     // 所以一律用原子量，而不是"靠调用方保证单线程"。
     std::atomic<State>   m_state{State::open};
     std::atomic<bool>    m_close_sent{false};
-    std::uint64_t        m_recv_msgs = 0;
+    /// 原子：io 线程自增，应用可能在别的线程读（`messages_received()`）。
+    std::atomic<std::uint64_t> m_recv_msgs{0};
 
     std::atomic<std::uint32_t>         m_rng{0x9E3779B9u};    ///< 客户端掩码（原子递增取数）
 

@@ -364,7 +364,10 @@ void WsSessionImpl::feed_one_frame(std::error_code& ec)
             return;
         }
     }
-    if (len > m_cfg.max_frame_bytes) {
+    // 0 表示"不限"（与 send_text/send_binary 的语义一致）。
+    // 以前这里只写 `len > m_cfg.max_frame_bytes`，用户把上限设成 0 就变成
+    // "任何带载荷的帧都被拒"——而发送侧把 0 当不限，两头打架。
+    if (m_cfg.max_frame_bytes != 0 && len > m_cfg.max_frame_bytes) {
         protocol_error(static_cast<std::uint16_t>(WsCloseCode::message_too_big), "frame too big");
         m_in.clear();
         return;
@@ -500,7 +503,7 @@ void WsSessionImpl::feed_one_frame(std::error_code& ec)
 
 void WsSessionImpl::deliver_message(std::string&& payload, bool is_text)
 {
-    ++m_recv_msgs;
+    m_recv_msgs.fetch_add(1, std::memory_order_relaxed);
     if (!m_handlers.on_message) {
         return;
     }
@@ -524,7 +527,19 @@ void WsSessionImpl::tick(std::chrono::steady_clock::time_point now)
     // 关闭握手的兜底：发了 close 但对方不回，2 秒后强关
     const std::int64_t dl = m_close_deadline_ns.load(std::memory_order_acquire);
     if (dl != 0 && now_ns_v >= dl) {
-        m_state.store(State::closed, std::memory_order_release);
+        m_close_deadline_ns.store(0, std::memory_order_release);   // 只触发一次
+
+        // ★ 这里**不能**先 `m_state.store(closed)` 再关。
+        //
+        //   `on_close` 的契约是"恰好一次"（websocket.hpp），而收口点只有一个：
+        //   io 线程上的 `ServerSession::on_close()` → `on_transport_closed()`，
+        //   它靠 `exchange(closed)` 判断"我是不是第一个到的"。
+        //   以前这里先把状态置成 closed，之后 on_transport_closed 一看已经是
+        //   closed 就直接 return —— 于是**这条路径一次都不回调**，
+        //   应用靠 on_close 清理的每连接状态（订阅表、会话表）全部残留。
+        //
+        //   现在只关传输，通知交给 on_transport_closed：
+        //   它跑在 io 线程上，顺带满足"回调在该连接的 io 线程"的契约。
         if (m_io.close) {
             m_io.close();
         }
@@ -536,8 +551,10 @@ void WsSessionImpl::tick(std::chrono::steady_clock::time_point now)
                              m_cfg.idle_timeout).count();
     if (idle_ns > 0 &&
         now_ns_v - m_last_rx_ns.load(std::memory_order_relaxed) > idle_ns) {
+        // 同上：先发 close 帧（close() 内部若发不出去，自己会走 fail_transport
+        // 并回调），再把传输关掉；**不要**在这里置 closed —— 否则随后的
+        // on_transport_closed 会以为自己来晚了，on_close 就一次都不会到。
         close(static_cast<std::uint16_t>(WsCloseCode::going_away), "idle timeout");
-        m_state.store(State::closed, std::memory_order_release);
         if (m_io.close) {
             m_io.close();
         }

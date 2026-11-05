@@ -44,6 +44,23 @@
 #include <system_error>
 #include <utility>
 
+namespace {
+
+/// steady_clock 的纳秒计数（跨线程比较的统一刻度）。
+inline std::int64_t now_ns_v()
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+inline std::int64_t to_ns_v(std::chrono::milliseconds d)
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(d).count();
+}
+
+} // namespace
+
 namespace httpmech {
 
 namespace detail {
@@ -135,7 +152,7 @@ public:
     {
         m_read_buf        = std::make_shared<std::vector<char>>(kReadChunk);
         m_writer.session  = this;
-        m_last_activity   = std::chrono::steady_clock::now();
+        m_last_activity_ns.store(now_ns_v(), std::memory_order_relaxed);
     }
 
     ~ServerSession() override = default;
@@ -166,11 +183,19 @@ public:
             close_now();
             return;
         }
-        m_last_activity = std::chrono::steady_clock::now();
-        m_busy          = true;
+        const std::int64_t now_ns = now_ns_v();
+        m_last_activity_ns.store(now_ns, std::memory_order_relaxed);
+        m_busy.store(true, std::memory_order_release);
+
+        // 本请求的第一个字节：记下起点（头部超时从这一刻算起）。
+        if (!m_req_headers_done.load(std::memory_order_acquire)) {
+            std::int64_t expected = 0;
+            (void)m_request_start_ns.compare_exchange_strong(
+                expected, now_ns, std::memory_order_relaxed);
+        }
 
         const auto* p = static_cast<const std::uint8_t*>(buf.data);
-        if (m_is_ws) {
+        if (m_is_ws.load(std::memory_order_acquire)) {
             if (m_ws) {
                 m_ws->on_bytes(span<const std::uint8_t>{p, n});
             }
@@ -179,7 +204,7 @@ public:
             pump();
         }
 
-        m_busy = false;
+        m_busy.store(false, std::memory_order_release);
         if (m_closed.load(std::memory_order_relaxed)) {
             return;
         }
@@ -227,16 +252,49 @@ public:
 
     void check_idle(std::chrono::milliseconds idle)
     {
-        if (m_closed.load(std::memory_order_relaxed) || m_busy) {
+        if (m_closed.load(std::memory_order_relaxed) ||
+            m_busy.load(std::memory_order_acquire)) {
             return;
         }
-        if (m_is_ws) {
+        if (m_is_ws.load(std::memory_order_acquire)) {
             if (m_ws) {
                 m_ws->tick(std::chrono::steady_clock::now());
             }
             return;   // WS 的空闲超时由 WebSocketConfig 管
         }
-        if (std::chrono::steady_clock::now() - m_last_activity > idle) {
+
+        // ★ 三个阶段分开判。以前只有一条"距上次任意数据多久 > idle_timeout"，
+        //   于是 `ServerConfig::header_timeout` / `body_idle_timeout` 两个配置
+        //   **一次都没被读过**（只出现在头文件里）—— 防 slowloris 只是文档。
+        const std::int64_t now    = now_ns_v();
+        const std::int64_t last   = m_last_activity_ns.load(std::memory_order_relaxed);
+        const std::int64_t start  = m_request_start_ns.load(std::memory_order_relaxed);
+        const bool         hdone  = m_req_headers_done.load(std::memory_order_acquire);
+
+        // ① 头部阶段（请求刚开始、头还没收完）：**从第一个字节算起**。
+        //    slowloris 的招式是"每隔一会儿发一个字节"，永远有"新数据"，
+        //    所以绝不能拿"距上次数据"当判据。
+        if (start != 0 && !hdone) {
+            const auto ht = m_owner->cfg.header_timeout;
+            if (ht.count() > 0 && now - start > to_ns_v(ht)) {
+                close_now();
+                return;
+            }
+            return;   // 头还没收完：body 判据不适用
+        }
+
+        // ② body 阶段：两次收到数据之间的最大间隔
+        if (start != 0 && hdone) {
+            const auto bt = m_owner->cfg.body_idle_timeout;
+            if (bt.count() > 0 && now - last > to_ns_v(bt)) {
+                close_now();
+                return;
+            }
+            return;
+        }
+
+        // ③ 没有请求在途：全局空闲超时
+        if (last != 0 && now - last > to_ns_v(idle)) {
             close_now();
         }
     }
@@ -318,8 +376,9 @@ private:
     std::error_code             m_ec;
     ResponseWriter::Impl        m_writer;
 
-    /// 升级成 WebSocket 之后，字节不再进 HTTP 解析器
-    bool                                        m_is_ws = false;
+    /// 升级成 WebSocket 之后，字节不再进 HTTP 解析器。
+    /// 原子：io 线程置位、sweeper 线程读（check_idle 的分支）。
+    std::atomic<bool>                           m_is_ws{false};
     std::shared_ptr<detail::WsSessionImpl>      m_ws;
 
     std::shared_ptr<std::vector<char>>       m_read_buf;
@@ -335,10 +394,23 @@ private:
     std::atomic<bool> m_closed{false};
     bool              m_stream_headers_done = false;
 
-    bool              m_busy              = false;
-    std::uint64_t     m_served            = 0;
+    /// 应用回调正在执行（io 线程置位、sweeper 读 —— 必须原子）。
+    /// 非原子时 sweeper 会读到陈旧的 false，把**正在长处理**的连接判成空闲
+    /// 并 close_now()，业务请求在回调执行中被掐断。
+    std::atomic<bool>         m_busy{false};
+    std::uint64_t             m_served = 0;
 
-    std::chrono::steady_clock::time_point m_last_activity;
+    /// 上次收到任意数据的时刻（纳秒）。跨线程读写，所以用原子整数而不是
+    /// time_point（后者没有原子版本，32 位平台上 64 位读还会被撕裂）。
+    std::atomic<std::int64_t> m_last_activity_ns{0};
+
+    /// 本请求收到**第一个字节**的时刻（0 = 当前没有在收的请求）。
+    /// 头部超时的基准：slowloris 的特征是"一直在慢慢发"，用"距上次数据多久"
+    /// 抓不到，必须用"从请求开始到现在多久"。
+    std::atomic<std::int64_t> m_request_start_ns{0};
+
+    /// 本请求的头是否已经收完（pump 收到 headers / message 时置位）。
+    std::atomic<bool>         m_req_headers_done{false};
 };
 
 // =============================================================================
@@ -371,6 +443,42 @@ void append_date_header(std::string& out)
 ///
 /// 支持 "127.0.0.1"（精确）与 IPv4 前缀 "10.0.0.0/8"。
 /// 只做 IPv4 比较：部署里 nginx 与进程同机（回环）或同网段，够用。
+/// 解析点分四段 IPv4。失败返回 false（不做任何宽松猜测）。
+bool parse_ipv4(std::string_view s, std::uint32_t& out) noexcept
+{
+    std::uint32_t v = 0;
+    int           parts = 0;
+    std::size_t   i = 0;
+    while (i < s.size()) {
+        unsigned octet = 0;
+        std::size_t digits = 0;
+        while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
+            octet = octet * 10 + static_cast<unsigned>(s[i] - '0');
+            if (octet > 255) {
+                return false;
+            }
+            ++i;
+            ++digits;
+        }
+        if (digits == 0) {
+            return false;
+        }
+        v = (v << 8) | octet;
+        ++parts;
+        if (i < s.size()) {
+            if (s[i] != '.') {
+                return false;
+            }
+            ++i;
+        }
+    }
+    if (parts != 4) {
+        return false;
+    }
+    out = v;
+    return true;
+}
+
 bool is_trusted_proxy(const netmech::Address& peer, const std::vector<std::string>& list)
 {
     if (list.empty()) {
@@ -381,43 +489,55 @@ bool is_trusted_proxy(const netmech::Address& peer, const std::vector<std::strin
         return false;   // IPv6 暂不支持前缀匹配
     }
 
+    std::uint32_t peer_ip = 0;
+    if (!parse_ipv4(ip, peer_ip)) {
+        return false;
+    }
+
     for (const auto& raw : list) {
         if (raw.empty()) {
             continue;
         }
-        const std::size_t slash = raw.find('/');
-        if (slash == std::string::npos) {
+        const std::string_view entry(raw);
+        const std::size_t slash = entry.find('/');
+        if (slash == std::string_view::npos) {
             if (raw == ip) {
                 return true;
             }
             continue;
         }
-        // CIDR：只比较前 prefix/8 个八位组
-        const std::string  base = raw.substr(0, slash);
-        const unsigned     plen = static_cast<unsigned>(std::strtoul(raw.c_str() + slash + 1, nullptr, 10));
-        if (plen > 32) {
-            continue;
-        }
-        const unsigned octets = plen / 8;
-        std::size_t a = 0, b = 0;
-        unsigned    matched = 0;
-        bool        ok      = true;
-        while (matched < octets) {
-            const std::size_t ae = base.find('.', a);
-            const std::size_t be = ip.find('.', b);
-            if (ae == std::string::npos || be == std::string::npos) {
+
+        // ★ 按**位**比较，不是按整八位组截断。
+        //
+        //   以前只比前 `plen/8` 个八位组，余数位直接扔掉：`10.0.0.0/25`
+        //   行为等同 `/24`、`192.168.1.0/30` 等同 `/24` —— **超指配的前缀会被
+        //   验证为合法**，X-Real-IP 这类身份头被采信的范围比用户意图宽。
+        //   安全相关的判断不能在"差不多"上让步。
+        unsigned plen = 0;
+        bool     ok   = true;
+        for (char ch : entry.substr(slash + 1)) {
+            if (ch < '0' || ch > '9') {
                 ok = false;
                 break;
             }
-            if (base.substr(a, ae - a) != ip.substr(b, be - b)) {
+            plen = plen * 10 + static_cast<unsigned>(ch - '0');
+            if (plen > 32) {
                 ok = false;
                 break;
             }
-            a = ae + 1;
-            b = be + 1;
-            ++matched;
         }
-        if (ok && matched == octets) {
+        if (!ok || slash + 1 >= entry.size()) {
+            continue;   // 前缀长度非法（空 / 非数字 / >32）
+        }
+
+        std::uint32_t base_ip = 0;
+        if (!parse_ipv4(entry.substr(0, slash), base_ip)) {
+            continue;   // 基址不是合法 IPv4（含 "010.0.0.0" 这种）
+        }
+
+        const std::uint32_t mask =
+            (plen == 0) ? 0u : (0xFFFFFFFFu << (32 - plen));
+        if ((base_ip & mask) == (peer_ip & mask)) {
             return true;
         }
     }
@@ -469,8 +589,10 @@ void ServerSession::pump()
             return;   // 等下一批数据
 
         case httpmech::Parser::Result::message:
+            // 头和体都到齐了（聚合模式下一次拿到整条消息）
+            m_req_headers_done.store(true, std::memory_order_release);
             dispatch_aggregate();
-            if (m_is_ws) {
+            if (m_is_ws.load(std::memory_order_acquire)) {
                 // 已经升级成 WebSocket：HTTP 解析器退出舞台，
                 // 后面的字节全部交给帧层（on_read 里分流）。
                 return;
@@ -482,6 +604,8 @@ void ServerSession::pump()
             break;
 
         case httpmech::Parser::Result::headers:
+            // 流式模式：后面的字节都是 body，切到 body_idle_timeout 判据
+            m_req_headers_done.store(true, std::memory_order_release);
             dispatch_stream_events({}, false);
             break;
 
@@ -574,6 +698,21 @@ void ServerSession::finish_writer(bool keep_alive)
     if (m_writer.sent || m_writer.aborted) {
         return;
     }
+
+    // ★ 应用没调 end()：说明它中途返回了（或忘了）。
+    //
+    //   头文件承诺"库会补一个 500，记 `Errc::response_incomplete`"，
+    //   但以前这里**不检查** —— 直接把当前状态按 200 + 半截 body 发出去，
+    //   客户端看到的是"请求成功"。忘调 end() 是应用最常见的低级错误之一，
+    //   把它伪装成成功比直接报错难查得多。
+    if (!m_writer.ended) {
+        m_writer.code = 500;
+        m_writer.reason.clear();
+        m_writer.body.clear();
+        m_writer.headers.clear();
+        m_writer.headers.set("Content-Length", "0");
+    }
+
     m_writer.sent = true;
 
     const ServerConfig& cfg = m_owner->cfg;
@@ -636,10 +775,13 @@ void ServerSession::finish_writer(bool keep_alive)
     }
 
     // 为下一条请求做准备（keep-alive）。升级成 WebSocket 之后不适用。
-    if (ka && !m_is_ws) {
+    if (ka && !m_is_ws.load(std::memory_order_acquire)) {
         m_parser.reset();
         m_writer.reset_for_request(false);
         m_stream_headers_done = false;
+        // 下一条请求重新开始计时（否则 header_timeout 会把上一条的时长算进来）
+        m_req_headers_done.store(false, std::memory_order_release);
+        m_request_start_ns.store(0, std::memory_order_relaxed);
     }
 }
 
@@ -647,7 +789,7 @@ bool ServerSession::switch_to_websocket(WebSocketHandlers handlers, WebSocketCon
                                         std::string path, std::string real_ip,
                                         std::string headers_raw)
 {
-    if (m_is_ws || !conn_snapshot()) {
+    if (m_is_ws.load(std::memory_order_acquire) || !conn_snapshot()) {
         return false;
     }
 
@@ -682,11 +824,18 @@ bool ServerSession::switch_to_websocket(WebSocketHandlers handlers, WebSocketCon
         detail::WsSessionImpl::Role::server, std::move(io), std::move(wcfg),
         std::move(handlers), std::move(path), std::move(real_ip), detail::from_address(m_peer),
         std::move(headers_raw));
-    m_is_ws = true;
+    m_is_ws.store(true, std::memory_order_release);
 
-    // 进 WS 模式后，HTTP 解析器不再使用；缓冲里若有残留字节（pipelining）
-    // 直接丢弃 —— 升级之后协议已经变了。
+    // 进 WS 模式后，HTTP 解析器不再使用。但缓冲里的残留字节**不能丢**：
+    // 客户端收到 101 之后可能立刻就把第一帧发出来了（同机 / 低 RTT 场景
+    // 尤其常见），那些字节此刻正躺在解析器缓冲里。
+    // 以前这里直接丢弃，表现为"首帧静默消失"——而客户端那一侧是做了交接的
+    // （client.cpp 的 "101 之后可能已经跟着帧了"），服务端没做。
+    const auto rest = m_parser.pending_bytes();
     m_ws->start();
+    if (!rest.empty()) {
+        m_ws->on_bytes(rest);
+    }
     return true;
 }
 
@@ -937,25 +1086,45 @@ std::uint64_t HttpServer::protocol_errors_total() const noexcept
 
 void ResponseWriter::set_status(Status s, std::string_view reason)
 {
-    m_impl->status = s;
-    m_impl->code   = static_cast<std::uint16_t>(s);
-    m_impl->reason.assign(reason);
+    set_status(static_cast<std::uint16_t>(s), reason);
 }
 
 void ResponseWriter::set_status(std::uint16_t code, std::string_view reason)
 {
     m_impl->status = status_from(code);
     m_impl->code   = code;
+
+    // ★ 原因短语里出现 CR/LF 会把响应劈成两条（response splitting）。
+    //   解析侧把 TE+CL 冲突、obs-fold 都拒了，生成侧应当对称。
+    //   发现非法就回落到标准短语 —— 宁可措辞不准，也不要拼出一条被截断的报文。
+    if (reason.find_first_of("\r\n") != std::string_view::npos) {
+        m_impl->reason.clear();
+        return;
+    }
     m_impl->reason.assign(reason);
 }
 
 void ResponseWriter::set_header(std::string_view name, std::string_view value)
 {
+    // 头名必须是 token（不含 CR/LF/冒号），值里不能有 CR/LF —— 否则应用
+    // 拼进来的脏数据会变成第二条响应。解析侧已经这么严了，生成侧对称处理。
+    if (name.empty() || name.find_first_of("\r\n:") != std::string_view::npos) {
+        return;
+    }
+    if (value.find_first_of("\r\n") != std::string_view::npos) {
+        return;
+    }
     m_impl->headers.set(name, value);
 }
 
 void ResponseWriter::add_header(std::string_view name, std::string_view value)
 {
+    if (name.empty() || name.find_first_of("\r\n:") != std::string_view::npos) {
+        return;
+    }
+    if (value.find_first_of("\r\n") != std::string_view::npos) {
+        return;
+    }
     m_impl->headers.add(name, value);
 }
 

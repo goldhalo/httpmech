@@ -836,6 +836,85 @@ void test_websocket_client_e2e()
     srv->stop();
 }
 
+// ---------------------------------------------------------------------------
+// WS 的**超时终止**路径必须回调 on_close（恰好一次）
+//
+// 这条以前是零覆盖，而它正是 🔴 的病灶：tick 的两个超时分支只置
+// `state=closed` + 关传输，随后的 on_transport_closed 一看状态已经是 closed
+// 就直接 return —— **一次都不回调**，应用靠 on_close 清理的每连接状态全残留。
+//
+// 做法：idle_timeout 调到 300ms（默认 120s），握手后什么都不发，等 sweeper
+// 把这条件收掉。
+// ---------------------------------------------------------------------------
+void test_websocket_idle_timeout_calls_on_close()
+{
+    g_case = "websocket idle timeout on_close";
+
+    httpmech::ServerConfig cfg;
+    cfg.local                    = {"127.0.0.1", 0};
+    cfg.emit_date                = false;
+    cfg.server_name              = "httpmech-ut";
+    cfg.websocket.idle_timeout   = std::chrono::milliseconds(300);   // 仅测试
+    cfg.websocket.ping_interval  = std::chrono::milliseconds(0);     // 别让 ping 续命
+
+    std::atomic<int> closed{0};
+    std::atomic<int> opened{0};
+
+    auto router = std::make_shared<httpmech::Router>();
+
+    httpmech::WebSocketHandlers ws;
+    ws.on_open = [&opened](httpmech::WebSocketSession&) { opened.fetch_add(1); };
+    ws.on_close = [&closed](httpmech::WebSocketSession&, std::uint16_t,
+                            std::string_view) { closed.fetch_add(1); };
+    router->websocket("/ws", std::move(ws));
+
+    auto srv = httpmech::HttpServer::create(cfg, router);
+    REQUIRE(srv != nullptr);
+    REQUIRE(!srv->start());
+    const std::uint16_t port = srv->local().port();
+    REQUIRE(port != 0);
+
+    const int fd = tcp_connect("127.0.0.1", port);
+    REQUIRE(fd >= 0);
+
+    const std::string key = "dGhlIHNhbXBsZSBub25jZQ==";
+    const std::string req =
+        "GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\n"
+        "Connection: Upgrade\r\nSec-WebSocket-Key: " + key + "\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n";
+    REQUIRE(tcp_send_all(fd, req));
+
+    std::string head;
+    char        c = 0;
+    while (head.find("\r\n\r\n") == std::string::npos) {
+        if (!tcp_recv_exact(fd, &c, 1)) {
+            break;
+        }
+        head.push_back(c);
+    }
+    CHECK(head.rfind("HTTP/1.1 101", 0) == 0);
+
+    // 握手之后**一个字节都不发**：等 idle 超时（sweeper 每秒跳一次）
+    for (int i = 0; i < 100 && closed.load() == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    CHECK_EQ(opened.load(), 1);
+    if (closed.load() != 1) {
+        std::printf("    !! WS idle 超时的 on_close 调用次数 = %d（契约是恰好一次，"
+                    "修之前是 0 次）\n",
+                    closed.load());
+    }
+    CHECK_EQ(closed.load(), 1);
+
+    // 再等一会儿，确认不会补第二次
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    CHECK_EQ(closed.load(), 1);
+
+    ::close(fd);
+    srv->stop();
+}
+
 void test_websocket_e2e()
 {
     g_case = "websocket e2e";
@@ -1078,6 +1157,7 @@ int main()
         {"connection close",    test_connection_close_delivery},
         {"linger_zero guard",   test_linger_zero_guard},
         {"websocket e2e",       test_websocket_e2e},
+        {"ws idle timeout",     test_websocket_idle_timeout_calls_on_close},
         {"http client e2e",     test_http_client_e2e},
         {"http client chunked", test_http_client_chunked},
         {"websocket client e2e", test_websocket_client_e2e},

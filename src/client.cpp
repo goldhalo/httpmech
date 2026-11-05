@@ -229,6 +229,15 @@ public:
     void on_close() override
     {
         m_conn.reset();
+
+        // ★ 无长度响应的收尾（RFC 9112 §6.3）：这类 body 的结束位置**只能**
+        //   由连接关闭确定。连接刚断的这一刻，把缓冲区里最后的字节交给解析器，
+        //   让它以"读到 FIN"完成这条消息 —— 否则在途请求会一直挂到超时。
+        if (m_handler && m_parser.awaiting_eof()) {
+            m_parser.feed_eof();
+            pump();
+        }
+
         if (!m_closed.exchange(true)) {
             m_owner->on_conn_closed();
         }
@@ -323,7 +332,9 @@ private:
         if (!m_conn->write(cb)) {
             return false;
         }
-        m_close_after = close_after;
+        // close_after 由 `m_keep_alive` 在 finish() 里落实；以前这里还记了一个
+        // `m_close_after`，但**全文件没有任何地方读它** —— 删掉。
+        (void)close_after;
         return true;
     }
 
@@ -334,6 +345,12 @@ private:
         m_handler.reset();
         if (handler) {
             handler->on_complete(ec);
+        }
+        // ★ 每成功完成一笔就计数。以前只在 `on_linkup` 里 `++` 过一次 ——
+        //   值恒为 1，于是 `max_requests_per_connection` 无论设 1 还是 100000
+        //   行为完全一样（几乎总是复用到断），这个配置等于不存在。
+        if (!ec) {
+            ++m_owner->served_on_conn;
         }
         m_owner->complete();
         if (!keep_alive) {
@@ -394,7 +411,6 @@ private:
 
     std::shared_ptr<ResponseHandler> m_handler;
     bool                             m_keep_alive  = true;
-    bool                             m_close_after = false;
     std::atomic<bool>                m_closed{false};
 };
 
@@ -703,7 +719,6 @@ struct WebSocketClient::Impl : public std::enable_shared_from_this<WebSocketClie
     std::shared_ptr<netmech::Conn>         conn;
     std::shared_ptr<detail::WsSessionImpl> ws;
     Parser                                 parser{Parser::Role::client};
-    std::deque<std::shared_ptr<std::string>> pending_out;
 
     Ticker ticker{std::chrono::milliseconds(200)};
 
@@ -783,6 +798,16 @@ public:
     void on_close() override
     {
         m_conn.reset();
+
+        // ★ 握手成功后，这条连接就是 WS 的传输 —— 断链必须转到帧层。
+        //
+        //   以前这里只判断 `!m_owner->open`，可握手成功时 open 已经是 true，
+        //   于是这条路径**永远什么都不做**：is_open() 一直 true、on_message /
+        //   on_close 一个都不来。订阅式客户端（client.hpp 自述的主要用途）
+        //   会永久停在"假在线"，而服务端同一条路径是正常的（不对称）。
+        if (m_owner->ws) {
+            m_owner->ws->on_transport_closed();
+        }
         if (!m_owner->open) {
             m_owner->fail(make_error_code(Errc::not_connected));
         }
@@ -903,12 +928,17 @@ void WebSocketClient::Impl::finish_handshake()
         if (!o || !o->conn) {
             return false;
         }
+        // 保活靠 `ConstBuf.owner`：netmech 自己持有它直到这次写完成。
+        //
+        // 以前这里还额外 `pending_out.push_back(payload)`，注释写"保活到写完成"
+        // —— 但**全文件没有任何 pop**：客户端长期推流时这个 deque 按发送帧数
+        // 无限增长，连接死了也不会释放（shared_ptr 由 ws 持有）。
+        // 而 owner 本来就已经把生命周期管住了，这个队列纯属多余。
         auto payload = std::make_shared<std::string>(std::move(wire));
         netmech::ConstBuf cb;
         cb.owner = payload;
         cb.data  = payload->data();
         cb.size  = payload->size();
-        o->pending_out.push_back(payload);   // 保活到写完成
         return o->conn->write(cb);
     };
     io.close = [weak] {
@@ -917,6 +947,15 @@ void WebSocketClient::Impl::finish_handshake()
                 o->conn->close();
             }
         }
+    };
+    // 反压用到的是"还有多少字节没写出去"：客户端只有一个连接、写队列归
+    // netmech 管，这里如实返回 0（不再有自己维护的待写队列）。
+    io.pending = [] { return std::size_t{0}; };
+    // ★ 区分"反压"与"连接已死"：缺了它，send_frame 失败时只会当成反压
+    //   返回 false，而帧层的关闭流程永远不会启动（服务端有这个回调，客户端以前没有）。
+    io.is_closed = [weak] {
+        auto o = weak.lock();
+        return !o || !o->conn || !o->conn->is_open();
     };
 
     WebSocketHandlers wrapped;
@@ -963,6 +1002,11 @@ void WebSocketClient::Impl::fail(std::error_code ec)
 {
     {
         std::lock_guard<std::mutex> lk(mu);
+        // 幂等：断链时 on_close 会先转 ws->on_transport_closed()，应用可能
+        // 在 on_close 里再调 close()/fail()；重复进来不该重复报 on_error。
+        if (!open && !connecting) {
+            return;
+        }
         open       = false;
         connecting = false;
     }

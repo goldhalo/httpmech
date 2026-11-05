@@ -103,6 +103,16 @@ public:
     ///       让"一次 feed 多个事件"的循环写法更清楚。
     Result next(std::error_code& ec);
 
+    /// 告诉解析器"连接已经结束（读到 FIN 了）"。
+    ///
+    /// @note 只有一种情况需要它：响应既没有 Content-Length 也没有 chunked
+    ///       （RFC 9112 §6.3），此时 body 的结束位置**只能**由连接关闭确定。
+    ///       客户端在 `on_close` 里调一次，随后 `next()` 就会把这条消息收尾。
+    void feed_eof();
+
+    /// 是否正在等"连接结束"来定界（见 `feed_eof()`）。
+    [[nodiscard]] bool awaiting_eof() const noexcept;
+
     /// 当前消息。仅当结果为 `message` / `headers` / `body_chunk` / `message_end`
     /// 时有效。
     [[nodiscard]] const HttpRequest&  request() const noexcept;

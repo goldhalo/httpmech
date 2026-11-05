@@ -143,6 +143,8 @@ struct Parser::Impl {
         chunk_data,
         chunk_crlf,
         trailers,
+        /// 无长度信息的响应：body 一直读到连接关闭（RFC 9112 §6.3 最后一条）。
+        body_until_eof,
         done,
     };
     St            st = St::headers;
@@ -151,6 +153,8 @@ struct Parser::Impl {
 
     span<const std::uint8_t> chunk_view{};
     std::uint64_t            messages = 0;
+    /// 调用方已经喂过"连接结束"（finish_message 的条件之一）。
+    bool                     eof_seen = false;
     bool                     failed   = false;
 
     Impl(Role r, Config c) : role(r), cfg(std::move(c))
@@ -371,7 +375,18 @@ void Parser::Impl::decide_framing(std::error_code& ec)
         return;
     }
 
-    // 请求没有 body；响应既无长度也无 chunked（按无 body 处理，不读到底断开）
+    // ★ RFC 9112 §6.3 的最后一条：**响应**既没有 Content-Length 也没有
+    //   chunked 时，body 一直延续到连接关闭为止，而且这条连接**不可复用**。
+    //
+    //   以前不分角色一律当"没有 body"立即完成，然后按 HTTP/1.1 的默认
+    //   keep-alive 复用连接 —— 对端若确实继续发 body，这些字节会被当成
+    //   **下一条响应**的开头解析：错误最后记到下一个请求头上，而且位置全乱。
+    //   请求侧保持不变（没有长度字段就确实没有 body）。
+    if (role == Role::client) {
+        resp.keep_alive = false;
+        st              = St::body_until_eof;
+        return;
+    }
     finish_message();
 }
 
@@ -410,6 +425,16 @@ Parser::Result Parser::feed(span<const std::uint8_t> data, std::error_code& ec)
         d.buf.insert(d.buf.end(), p, p + data.size());
     }
     return next(ec);
+}
+
+void Parser::feed_eof()
+{
+    m_impl->eof_seen = true;
+}
+
+bool Parser::awaiting_eof() const noexcept
+{
+    return m_impl && m_impl->st == Impl::St::body_until_eof;
 }
 
 Parser::Result Parser::next(std::error_code& ec)
@@ -579,6 +604,30 @@ Parser::Result Parser::next(std::error_code& ec)
                 d.finish_message();
             }
             continue;   // 非空行是 trailer，丢弃
+        }
+
+        case Impl::St::body_until_eof: {
+            // 有多少吃多少，然后等 feed_eof()
+            const std::size_t n = d.avail();
+            if (n > 0) {
+                if (d.body_owned.size() + n > d.cfg.limits.max_body_bytes) {
+                    d.fail(ec, Errc::body_too_large);
+                    return Result::need_more;
+                }
+                if (d.cfg.body_mode == BodyMode::stream) {
+                    d.chunk_view = span<const std::uint8_t>{
+                        reinterpret_cast<const std::uint8_t*>(d.data()), n};
+                    d.begin += n;
+                    return Result::body_chunk;
+                }
+                d.body_owned.append(d.data(), n);
+                d.begin += n;
+            }
+            if (!d.eof_seen) {
+                return Result::need_more;
+            }
+            d.finish_message();
+            continue;
         }
 
         case Impl::St::done: {
