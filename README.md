@@ -366,12 +366,15 @@ target_link_libraries(app PRIVATE httpmech::httpmech)
 装出来的结构：
 
 ```
-<prefix>/include/httpmech/*.hpp
-<prefix>/include/httpmech/thirdparty/picohttpparser.h
-<prefix>/lib/libhttpmech.a  libpicohttpparser.a
+<prefix>/include/httpmech/*.hpp                      # 只有本库的头
+<prefix>/lib/libhttpmech.a                           # picohttpparser 已编进来
 <prefix>/lib/cmake/httpmech/httpmech{Config,ConfigVersion,Targets}.cmake
 <prefix>/share/doc/httpmech/LICENSE
+<prefix>/share/doc/httpmech/LICENSE.picohttpparser   # MIT 要求保留的声明
 ```
+
+**picohttpparser 不再单独出库**：它被编进 `libhttpmech.a`（符号加了 `httpmech_`
+前缀，所以和 rtspmech 各内嵌一份也不会在链接期撞车）。使用方只需要链一个 `.a`。
 
 ---
 
@@ -382,6 +385,7 @@ httpmech/
 ├── include/httpmech/      对外头文件
 │   ├── httpmech.hpp       汇总
 │   ├── common.hpp         Method / Status / Limits / Errc
+│   ├── endpoint.hpp       端点（IP + 端口，不引 netmech）
 │   ├── span.hpp           只读 span
 │   ├── headers.hpp        HeadersView（借用）/ Headers（拥有）
 │   ├── message.hpp        HttpRequest / HttpResponse + 代理头识别
@@ -389,7 +393,7 @@ httpmech/
 │   ├── websocket.hpp      WebSocket 服务端（会话 / 配置 / 握手）
 │   ├── server.hpp         HttpServer / ResponseWriter / RequestHandler
 │   ├── router.hpp         Router：精确路由 + before/after
-│   └── client.hpp         【v0.2 预留，不实现】
+│   └── client.hpp         HttpClient / WebSocketClient
 ├── src/                   实现（parser / server / router / websocket / sha1+base64）
 ├── test/                  单元测试 + 端到端测试
 ├── example/hello_server.cpp
