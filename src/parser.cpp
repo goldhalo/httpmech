@@ -102,15 +102,93 @@ bool token_list_has(std::string_view list, std::string_view token) noexcept
     return false;
 }
 
-bool te_is_chunked(const HeadersView& h) noexcept
+/// Content-Length 的三态结果。
+///
+/// 以前直接复用 `message.hpp` 的 `optional` 版本：它把「非法」折叠成 nullopt，
+/// 调用方无法区分「没有这个头」和「这个头是坏的」——于是非法 CL 被当成
+/// 无 body 静默放行（RFC 9112 §6.3 要求 400），构成请求走私面。
+struct ContentLength {
+    enum class State : std::uint8_t { absent, present, invalid };
+    State         st    = State::absent;
+    std::uint64_t value = 0;
+};
+
+bool parse_u64_strict(std::string_view s, std::uint64_t& out) noexcept
 {
-    const auto te = h.get("Transfer-Encoding");
-    if (te.empty()) {
+    if (s.empty() || s.size() > 20) {
         return false;
     }
-    const std::size_t pos  = te.rfind(',');
-    const std::string_view last = (pos == std::string_view::npos) ? te : te.substr(pos + 1);
-    return iequals(trim_ows(last), "chunked");
+    std::uint64_t v = 0;
+    for (char c : s) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+        const auto d = static_cast<std::uint64_t>(c - '0');
+        if (v > (UINT64_MAX - d) / 10) {
+            return false;
+        }
+        v = v * 10 + d;
+    }
+    out = v;
+    return true;
+}
+
+ContentLength parse_content_length_strict(const HeadersView& h) noexcept
+{
+    ContentLength r;
+    bool          seen = false;
+    for (const auto& f : h.all()) {
+        if (!iequals(f.name, "Content-Length")) {
+            continue;
+        }
+        std::uint64_t v = 0;
+        if (!parse_u64_strict(trim_ows(f.value), v)) {
+            r.st = ContentLength::State::invalid;
+            return r;
+        }
+        if (seen && r.value != v) {
+            r.st = ContentLength::State::invalid;   // 多个不同值 = 协议错误
+            return r;
+        }
+        seen    = true;
+        r.value = v;
+    }
+    r.st = seen ? ContentLength::State::present : ContentLength::State::absent;
+    return r;
+}
+
+/// Transfer-Encoding 的最终状态（RFC 9112 §6.1）。
+///
+/// 请求的最后一个 coding 必须是 chunked；否则整条请求非法 —— **不能**按
+/// 「没有 body」继续读，否则剩余字节就是下一条请求（请求走私）。
+/// 注意可能有多个 Transfer-Encoding 字段，要按出现顺序取全局最后一段。
+enum class TeState : std::uint8_t { absent, chunked, unsupported };
+
+TeState te_state(const HeadersView& h) noexcept
+{
+    bool             seen = false;
+    std::string_view last;
+    for (const auto& f : h.all()) {
+        if (!iequals(f.name, "Transfer-Encoding")) {
+            continue;
+        }
+        std::string_view v = f.value;
+        std::size_t      i = 0;
+        while (i <= v.size()) {
+            const std::size_t comma = v.find(',', i);
+            const std::size_t end   = (comma == std::string_view::npos) ? v.size() : comma;
+            last = trim_ows(v.substr(i, end - i));
+            seen = true;
+            if (comma == std::string_view::npos) {
+                break;
+            }
+            i = comma + 1;
+        }
+    }
+    if (!seen) {
+        return TeState::absent;
+    }
+    return iequals(last, "chunked") ? TeState::chunked : TeState::unsupported;
 }
 
 } // namespace
@@ -343,11 +421,22 @@ void Parser::Impl::decide_framing(std::error_code& ec)
         resp.keep_alive = ka;
     }
 
-    const bool chunked     = te_is_chunked(hv);
-    const auto content_len = parse_content_length(hv);
+    const TeState      te = te_state(hv);
+    const ContentLength cl = parse_content_length_strict(hv);
 
+    // TE 出现但最后一段不是 chunked：无法定界，必须拒（否则剩余字节会被
+    // 当成下一条请求/响应）。
+    if (te == TeState::unsupported) {
+        fail(ec, Errc::unsupported_transfer_coding);
+        return;
+    }
+    // 非法或自相矛盾的 Content-Length：同样不能按「无 body」放行。
+    if (cl.st == ContentLength::State::invalid) {
+        fail(ec, Errc::bad_content_length);
+        return;
+    }
     // Content-Length 与 Transfer-Encoding 同时出现 = 请求走私的经典构造
-    if (chunked && content_len) {
+    if (te == TeState::chunked && cl.st == ContentLength::State::present) {
         fail(ec, Errc::conflicting_length);
         return;
     }
@@ -361,15 +450,15 @@ void Parser::Impl::decide_framing(std::error_code& ec)
         }
     }
 
-    if (chunked) {
+    if (te == TeState::chunked) {
         st = St::chunk_size;
         return;
     }
-    if (content_len) {
-        if (*content_len == 0) {
+    if (cl.st == ContentLength::State::present) {
+        if (cl.value == 0) {
             finish_message();
         } else {
-            remaining = *content_len;
+            remaining = cl.value;
             st        = St::body_fixed;
         }
         return;

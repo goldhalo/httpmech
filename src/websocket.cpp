@@ -283,10 +283,43 @@ void WsSessionImpl::fail_transport()
 
 void WsSessionImpl::protocol_error(std::uint16_t code, std::string_view why)
 {
-    close(code, why);
+    // 协议错误要**带着真实 code** 通知应用，而且恰好一次。
+    //
+    // on_transport_closed() 是正常关闭的收口（它只能报 abnormal 1006），
+    // 所以这里自己发「close 帧 + 写完后关传输」，然后直接回调并置 closed：
+    //   · close 帧用 close_after=true 交给底层，保证先写出去再关 TCP；
+    //   · 回调后再置 closed，随后的 on_transport_closed() 看到 closed 会返回，
+    //     不会第二次通知。
+    //
+    // 以前这里先置 closed 再关传输：close 帧可能没写出去，且 on_transport_closed()
+    // 以为自己来晚了 —— 所有协议错误（RSV 非 0、掩码错、未知 opcode、close code
+    // 非法、分片错乱…）一次 on_close 都不回调，应用靠它清理的状态全部残留。
+    if (m_state.load(std::memory_order_acquire) == State::closed) {
+        return;
+    }
+    m_state.store(State::closing, std::memory_order_release);
+    m_close_sent.store(true, std::memory_order_release);
+
+    std::string payload;
+    payload.push_back(static_cast<char>((code >> 8) & 0xFF));
+    payload.push_back(static_cast<char>(code & 0xFF));
+    const std::size_t take = std::min<std::size_t>(why.size(), 123);
+    payload.append(why.data(), take);
+
+    const bool sent = send_frame(
+        kOpClose, true,
+        span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(payload.data()),
+                                 payload.size()},
+        true /* close_after：写完 close 帧就关传输 */);
+    if (!sent) {
+        // 连 close 帧都发不出去：按传输丢失收口（fail_transport 报 abnormal）。
+        fail_transport();
+        return;
+    }
+
     m_state.store(State::closed, std::memory_order_release);
-    if (m_io.close) {
-        m_io.close();
+    if (m_handlers.on_close) {
+        m_handlers.on_close(*this, code, why);
     }
 }
 

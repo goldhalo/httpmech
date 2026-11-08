@@ -194,14 +194,17 @@ public:
 
     bool on_open(std::shared_ptr<netmech::Conn> c) override
     {
-        m_conn = std::move(c);
+        {
+            std::lock_guard<std::mutex> lk(m_conn_mu);
+            m_conn = std::move(c);
+        }
         m_owner->on_connected(shared_from_this());
         return start_read();
     }
 
     void on_read(std::error_code ec, netmech::Buf b, std::size_t n) override
     {
-        if (!m_conn) {
+        if (!conn_snapshot()) {
             return;
         }
         if (ec) {
@@ -211,7 +214,7 @@ public:
         const auto* p = static_cast<const std::uint8_t*>(b.data);
         m_parser.feed(span<const std::uint8_t>{p, n}, m_ec);
         pump();
-        if (!m_closed.load() && m_conn && !start_read()) {
+        if (!m_closed.load() && !start_read()) {
             close_conn();
         }
     }
@@ -228,7 +231,10 @@ public:
 
     void on_close() override
     {
-        m_conn.reset();
+        {
+            std::lock_guard<std::mutex> lk(m_conn_mu);
+            m_conn.reset();
+        }
 
         // ★ 无长度响应的收尾（RFC 9112 §6.3）：这类 body 的结束位置**只能**
         //   由连接关闭确定。连接刚断的这一刻，把缓冲区里最后的字节交给解析器，
@@ -243,13 +249,19 @@ public:
         }
     }
 
-    bool usable() const noexcept { return m_conn && !m_closed.load(); }
+    bool usable() const noexcept { return conn_snapshot() && !m_closed.load(); }
 
     void close_conn() noexcept
     {
-        if (m_conn) {
-            m_conn->close();
+        if (auto c = conn_snapshot()) {
+            c->close();
         }
+    }
+
+    std::shared_ptr<netmech::Conn> conn_snapshot() const
+    {
+        std::lock_guard<std::mutex> lk(m_conn_mu);
+        return m_conn;
     }
 
     /// 发一笔请求。handler 由本会话保存到响应结束（连接内串行，不需要锁）。
@@ -311,16 +323,21 @@ private:
 
     bool start_read()
     {
+        auto c = conn_snapshot();
+        if (!c) {
+            return false;
+        }
         netmech::Buf b;
         b.owner = m_buf;
         b.data  = m_buf->data();
         b.size  = m_buf->size();
-        return m_conn->read(b, netmech::ReadMode::some);
+        return c->read(b, netmech::ReadMode::some);
     }
 
     bool send(std::string wire, bool close_after)
     {
-        if (!m_conn) {
+        auto c = conn_snapshot();
+        if (!c) {
             return false;
         }
         auto payload = std::make_shared<std::string>(std::move(wire));
@@ -329,7 +346,7 @@ private:
         cb.data  = payload->data();
         cb.size  = payload->size();
         m_pending.push_back(payload);
-        if (!m_conn->write(cb)) {
+        if (!c->write(cb)) {
             return false;
         }
         // close_after 由 `m_keep_alive` 在 finish() 里落实；以前这里还记了一个
@@ -403,6 +420,7 @@ private:
     }
 
     std::shared_ptr<HttpClient::Impl>        m_owner;
+    mutable std::mutex                       m_conn_mu;   ///< 保护 m_conn（app 线程 close vs io 线程 on_close）
     std::shared_ptr<netmech::Conn>           m_conn;
     std::shared_ptr<std::vector<char>>       m_buf;
     Parser                                   m_parser;

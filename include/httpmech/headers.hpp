@@ -58,8 +58,8 @@ public:
     /// 按名字查第一个值（大小写不敏感）。没有返回空 view。
     [[nodiscard]] std::string_view get(std::string_view name) const noexcept;
 
-    /// 是否存在该字段。
-    [[nodiscard]] bool has(std::string_view name) const noexcept { return !get(name).empty(); }
+    /// 是否存在该字段（字段存在但值为空也算存在）。
+    [[nodiscard]] bool has(std::string_view name) const noexcept { return count(name) > 0; }
 
     /// 同名字段出现几次（例如多个 Set-Cookie）。
     [[nodiscard]] std::size_t count(std::string_view name) const noexcept;
@@ -96,7 +96,7 @@ public:
     std::size_t remove(std::string_view name);
 
     [[nodiscard]] std::string_view get(std::string_view name) const noexcept;
-    [[nodiscard]] bool has(std::string_view name) const noexcept { return !get(name).empty(); }
+    [[nodiscard]] bool has(std::string_view name) const noexcept { return count(name) > 0; }
     [[nodiscard]] std::size_t count(std::string_view name) const noexcept;
 
     [[nodiscard]] std::size_t size() const noexcept { return m_items.size(); }

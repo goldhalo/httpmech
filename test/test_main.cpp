@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <atomic>
 #include <cstring>
 #include <future>
 #include <memory>
@@ -798,12 +799,15 @@ void test_websocket_client_e2e()
     std::error_code conn_ec;
 
     httpmech::WebSocketClientHandlers h;
-    h.on_open = [&](httpmech::WebSocketSession& s) {
+    // 按值捕获 Waiter：回调可能在测试函数返回后仍在 io 线程上跑，
+    // 按引用捕获会让 Waiter 先析构（TSan 报过 cond_destroy 竞争）。
+    h.on_open = [&, wait_open](httpmech::WebSocketSession& s) {
         wait_open->signal();
         s.send_text("client-hi");
     };
-    h.on_message = [&](httpmech::WebSocketSession&, httpmech::span<const std::uint8_t> d,
-                       bool /*text*/) {
+    h.on_message = [&, wait_first, wait_echo](httpmech::WebSocketSession&,
+                                              httpmech::span<const std::uint8_t> d,
+                                              bool /*text*/) {
         const std::string m{reinterpret_cast<const char*>(d.data()), d.size()};
         if (!wait_first->done) {
             first_msg = m;
@@ -814,7 +818,7 @@ void test_websocket_client_e2e()
         }
     };
     h.on_close = [](httpmech::WebSocketSession&, std::uint16_t, std::string_view) {};
-    h.on_error = [&](std::error_code ec) {
+    h.on_error = [&, wait_open](std::error_code ec) {
         conn_ec = ec;
         wait_open->signal();
     };
@@ -834,6 +838,8 @@ void test_websocket_client_e2e()
 
     cli->close();
     srv->stop();
+    // 等 io 线程把在途回调跑完，再让 Waiter 析构
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
 }
 
 // ---------------------------------------------------------------------------
@@ -1034,6 +1040,135 @@ void test_websocket_e2e()
     srv->stop();
 }
 
+
+// =============================================================================
+//  Parser：Content-Length / Transfer-Encoding 的三态校验
+//
+//  以前非法 CL、冲突 CL、TE 非 chunked 全都被当成「没有 body」静默放行，
+//  剩余字节会被当成下一条请求（请求走私面，RFC 9112 §6.3 要求 400）。
+// =============================================================================
+void test_parser_length_validation()
+{
+    g_case = "invalid content-length";
+    {
+        httpmech::Parser p{httpmech::Parser::Role::server};
+        std::error_code ec;
+        p.feed(bytes("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: abc\r\n\r\n"), ec);
+        CHECK_EQ(ec, httpmech::make_error_code(httpmech::Errc::bad_content_length));
+    }
+    g_case = "conflicting content-length";
+    {
+        httpmech::Parser p{httpmech::Parser::Role::server};
+        std::error_code ec;
+        p.feed(bytes("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n"
+                     "Content-Length: 10\r\n\r\nhellohello"),
+               ec);
+        CHECK_EQ(ec, httpmech::make_error_code(httpmech::Errc::bad_content_length));
+    }
+    g_case = "duplicate identical content-length";
+    {
+        httpmech::Parser p{httpmech::Parser::Role::server};
+        std::error_code ec;
+        p.feed(bytes("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n"
+                     "Content-Length: 5\r\n\r\nhello"),
+               ec);
+        CHECK(!ec);
+        CHECK_EQ(p.messages(), std::uint64_t{1});
+        CHECK_EQ(p.request().body.size(), std::size_t{5});
+    }
+    g_case = "transfer-encoding without final chunked";
+    {
+        httpmech::Parser p{httpmech::Parser::Role::server};
+        std::error_code ec;
+        p.feed(bytes("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n\r\n"), ec);
+        CHECK_EQ(ec, httpmech::make_error_code(httpmech::Errc::unsupported_transfer_coding));
+    }
+    g_case = "transfer-encoding across fields";
+    {
+        httpmech::Parser p{httpmech::Parser::Role::server};
+        std::error_code ec;
+        p.feed(bytes("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n"
+                     "Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"),
+               ec);
+        CHECK(!ec);
+        CHECK_EQ(p.messages(), std::uint64_t{1});
+        CHECK_EQ(p.request().body.size(), std::size_t{5});
+    }
+}
+
+// =============================================================================
+//  WS：协议错误（RSV 非 0）必须回调 on_close，且恰好一次
+// =============================================================================
+void test_websocket_protocol_error_closes_once()
+{
+    g_case = "ws protocol error on_close";
+
+    httpmech::ServerConfig cfg;
+    cfg.local       = {"127.0.0.1", 0};
+    cfg.emit_date   = false;
+    cfg.server_name = "httpmech-ut";
+
+    auto router = std::make_shared<httpmech::Router>();
+    auto closes = std::make_shared<std::atomic<int>>(0);
+    auto code   = std::make_shared<std::atomic<int>>(0);
+
+    httpmech::WebSocketHandlers ws;
+    ws.on_close = [closes, code](httpmech::WebSocketSession&, std::uint16_t c,
+                                 std::string_view) {
+        closes->fetch_add(1);
+        code->store(static_cast<int>(c));
+    };
+    router->websocket("/ws", std::move(ws));
+
+    auto srv = httpmech::HttpServer::create(cfg, router);
+    REQUIRE(srv != nullptr);
+    REQUIRE(!srv->start());
+    const std::uint16_t port = srv->local().port();
+    REQUIRE(port != 0);
+
+    const int fd = tcp_connect("127.0.0.1", port);
+    REQUIRE(fd >= 0);
+
+    const std::string req =
+        "GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\n"
+        "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n";
+    REQUIRE(tcp_send_all(fd, req));
+
+    std::string head;
+    char        c = 0;
+    while (head.find("\r\n\r\n") == std::string::npos) {
+        if (!tcp_recv_exact(fd, &c, 1)) {
+            break;
+        }
+        head.push_back(c);
+    }
+    CHECK(head.rfind("HTTP/1.1 101", 0) == 0);
+
+    // RSV1 = 1（0x41 = FIN|RSV1|text）：没有协商任何扩展，属于协议错误
+    REQUIRE(tcp_send_all(fd, ws_build_frame(0x41, "x")));
+
+    std::uint8_t op = 0;
+    std::string  payload;
+    CHECK(ws_read_frame(fd, op, payload));
+    CHECK_EQ(static_cast<int>(op), 0x8);
+    if (payload.size() >= 2) {
+        const auto got = static_cast<int>((static_cast<std::uint8_t>(payload[0]) << 8) |
+                                          static_cast<std::uint8_t>(payload[1]));
+        CHECK_EQ(got, 1002);
+    }
+
+    // 协议错误以前一次 on_close 都不回调（状态先被置 closed，收口以为来晚了）
+    for (int i = 0; i < 200 && closes->load() == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK_EQ(closes->load(), 1);
+    CHECK_EQ(code->load(), 1002);
+
+    ::close(fd);
+    srv->stop();
+}
+
 void test_server_e2e()
 {
     g_case = "server e2e";
@@ -1148,6 +1283,7 @@ int main()
         {"stream mode",         test_stream_mode},
         {"keep-alive",          test_keep_alive_semantics},
         {"limits",              test_limits},
+        {"parser length validation", test_parser_length_validation},
         {"proxy headers",       test_proxy_headers},
         {"headers container",   test_headers_container},
         {"websocket accept",    test_websocket_accept},
@@ -1158,6 +1294,7 @@ int main()
         {"linger_zero guard",   test_linger_zero_guard},
         {"websocket e2e",       test_websocket_e2e},
         {"ws idle timeout",     test_websocket_idle_timeout_calls_on_close},
+        {"ws protocol error on_close", test_websocket_protocol_error_closes_once},
         {"http client e2e",     test_http_client_e2e},
         {"http client chunked", test_http_client_chunked},
         {"websocket client e2e", test_websocket_client_e2e},

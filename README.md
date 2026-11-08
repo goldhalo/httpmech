@@ -28,7 +28,6 @@ TLS、HTTP/2、静态文件都交给前面的 nginx，本库只处理它转过�
 | keep-alive、流式 body、资源上限 | 连接池 / 自动重连 / 重定向跟随 |
 | `X-Real-IP` / `X-AGENT-SSL` 代理头识别（白名单） | 静态文件、gzip、multipart |
 | **客户端**：HttpClient（串行队列）/ WebSocketClient | 连接池、自动重连、cookie 罐 |
-| **客户端**：HttpClient（串行队列）/ WebSocketClient | 连接池、自动重连、cookie 罐 |
 
 设计取舍见 **[docs/design.md](docs/design.md)**（含与 wtoe::HttpProtocol 的对照）。
 
