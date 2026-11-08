@@ -83,6 +83,9 @@ struct WebSocketConfig {
 
     /// 是否严格校验文本帧的 UTF-8。默认关 —— 设备侧常发非标准字节，
     /// 严格校验会直接踢连接；要合规就打开。
+    ///
+    /// @note 关闭时**不会**校验，非法 UTF-8 会原样交给 `on_message`；
+    ///       应用若把文本当字符串做 JSON/日志处理，需自行容忍坏字节。
     bool validate_utf8 = false;
 };
 

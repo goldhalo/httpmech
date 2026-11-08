@@ -267,6 +267,11 @@ void WsSessionImpl::close(std::uint16_t code, std::string_view reason)
     m_close_deadline_ns.store(now_ns() + 2'000'000'000LL, std::memory_order_release);
 }
 
+void WsSessionImpl::protocol_error(std::uint16_t code, std::string_view why)
+{
+    close_with_frame(code, why);
+}
+
 void WsSessionImpl::fail_transport()
 {
     // 与 on_transport_closed() 共用同一道闸：谁先到谁负责通知，另一个直接返回。
@@ -282,9 +287,10 @@ void WsSessionImpl::fail_transport()
     }
 }
 
-void WsSessionImpl::protocol_error(std::uint16_t code, std::string_view why)
+void WsSessionImpl::close_with_frame(std::uint16_t code, std::string_view why)
 {
-    // 协议错误要**带着真实 code** 通知应用，而且恰好一次。
+    // 「发 close 帧（写完关传输）→ 带真实 code 通知应用 → 再置 closed」。
+    // 协议错误与空闲超时共用这条收尾路径。
     //
     // on_transport_closed() 是正常关闭的收口（它只能报 abnormal 1006），
     // 所以这里自己发「close 帧 + 写完后关传输」，然后直接回调并置 closed：
@@ -600,10 +606,8 @@ void WsSessionImpl::tick(std::chrono::steady_clock::time_point now)
         // 同上：先发 close 帧（close() 内部若发不出去，自己会走 fail_transport
         // 并回调），再把传输关掉；**不要**在这里置 closed —— 否则随后的
         // on_transport_closed 会以为自己来晚了，on_close 就一次都不会到。
-        close(static_cast<std::uint16_t>(WsCloseCode::going_away), "idle timeout");
-        if (m_io.close) {
-            m_io.close();
-        }
+        close_with_frame(static_cast<std::uint16_t>(WsCloseCode::going_away),
+                         "idle timeout");
         return;
     }
 

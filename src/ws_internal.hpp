@@ -97,6 +97,9 @@ private:
     /// 传输层已经不可用：通知应用一次 on_close，然后关干净。
     void        fail_transport();
 
+    /// 发 close 帧（写完关传输）+ 带真实 code 通知应用，恰好一次。
+    /// 协议错误与空闲超时共用；返回后状态为 closed。
+    void        close_with_frame(std::uint16_t code, std::string_view why);
     void        protocol_error(std::uint16_t code, std::string_view why);
 
     Role                               m_role;

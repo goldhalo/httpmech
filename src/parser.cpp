@@ -84,6 +84,17 @@ bool parse_chunk_size(std::string_view line, std::uint64_t& out) noexcept
     return true;
 }
 
+/// 找 `\r\n\r\n`（相对指针）；找不到返回 npos。
+std::size_t find_head_end(const char* p, std::size_t n) noexcept
+{
+    for (std::size_t i = 0; i + 3 < n; ++i) {
+        if (p[i] == '\r' && p[i + 1] == '\n' && p[i + 2] == '\r' && p[i + 3] == '\n') {
+            return i;
+        }
+    }
+    return std::string_view::npos;
+}
+
 /// Connection 这类逗号列表里是否含某 token（大小写不敏感）。
 bool token_list_has(std::string_view list, std::string_view token) noexcept
 {
@@ -285,7 +296,12 @@ bool Parser::Impl::parse_head(std::error_code& ec)
     if (n == 0) {
         return false;
     }
-    if (n > cfg.limits.max_header_bytes) {
+    // 上限按「头块」算，不是「当前缓冲总字节」：同一批 read 里可能已经
+    // 带着 body（大 POST 常见），以前会把 body 字节算进头部上限，
+    // 明明头部很小却回 431。只有「连 CRLFCRLF 都还没出现且已超上限」
+    // 才是真的头部超限（slowloris 场景）。
+    if (n > cfg.limits.max_header_bytes
+        && find_head_end(data(), n) == std::string_view::npos) {
         fail(ec, Errc::header_too_large);
         return false;
     }
@@ -330,6 +346,10 @@ bool Parser::Impl::parse_head(std::error_code& ec)
 
     // ---- 头块拷一份，指针全部改指副本 ----
     const std::size_t block = static_cast<std::size_t>(rc);
+    if (block > cfg.limits.max_header_bytes) {
+        fail(ec, Errc::header_too_large);
+        return false;
+    }
     header_owned.assign(b, block);
 
     char*       nbase = header_owned.data();

@@ -886,7 +886,11 @@ private:
         cb.data  = payload->data();
         cb.size  = payload->size();
         m_pending.push_back(payload);
-        return m_conn->write(cb);
+        if (!m_conn->write(cb)) {
+            m_pending.pop_back();   // 反压时不会再有 on_write 来 pop
+            return false;
+        }
+        return true;
     }
 
     bool start_read()
