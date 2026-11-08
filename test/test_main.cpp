@@ -390,6 +390,21 @@ void test_parser_length_validation()
         CHECK_EQ(p.messages(), std::uint64_t{1});
         CHECK_EQ(p.request().body.size(), std::size_t{5});
     }
+    g_case = "small header limit with body in same feed";
+    {
+        // 头部上限按「头块」算，不能把同一批 read 里的 body 也算进去
+        httpmech::Parser::Config cfg;
+        cfg.limits.max_header_bytes = 64;
+        httpmech::Parser p{httpmech::Parser::Role::server, cfg};
+        std::error_code ec;
+        const std::string wire =
+            "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 100\r\n\r\n" +
+            std::string(100, 'x');
+        p.feed(bytes(wire), ec);
+        CHECK(!ec);
+        CHECK_EQ(p.messages(), std::uint64_t{1});
+        CHECK_EQ(p.request().body.size(), std::size_t{100});
+    }
 }
 
 
