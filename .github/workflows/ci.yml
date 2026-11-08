@@ -310,8 +310,16 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: 检出
+      - name: 检出 httpmech
         uses: actions/checkout@v4
+        with:
+          path: httpmech
+
+      - name: 检出 netmech（依赖）
+        uses: actions/checkout@v4
+        with:
+          repository: goldhalo/netmech
+          path: netmech
 
       - name: 安装工具
         run: |
@@ -319,6 +327,7 @@ jobs:
           sudo apt-get install -y cmake ninja-build g++
 
       - name: 配置（Debug + SHARED）
+        working-directory: httpmech
         run: |
           export CC=gcc CXX=g++
           cmake -S . -B build-shared -G Ninja \
@@ -327,10 +336,17 @@ jobs:
                 -DHTTPMECH_WARNINGS_AS_ERRORS=ON
 
       - name: 构建
+        working-directory: httpmech
         run: cmake --build build-shared --parallel
 
       - name: 测试（链接 libhttpmech.so）
+        working-directory: httpmech
         run: ctest --test-dir build-shared --output-on-failure --timeout 180
+
+      - name: 直接运行测试（失败时取详细输出）
+        if: failure()
+        working-directory: httpmech
+        run: ./build-shared/bin/httpmech_ut || true
 
   quality:
     name: 质量检查
