@@ -243,9 +243,14 @@ public:
             std::lock_guard<std::mutex> lk(m_conn_mu);
             m_conn.reset();
         }
-        if (!m_closed.exchange(true)) {
+        // ★ 计数用独立的 m_counted 收口，不能挂 m_closed 上：
+        //   close_now()（协议错误 / 超时 / abort / 发送失败）会先置 m_closed，
+        //   之后 netmech 回调这里时 `!m_closed.exchange(true)` 不成立 ——
+        //   connection_count() 只增不减。以前只有「对端先断」能减。
+        if (!m_counted.exchange(true, std::memory_order_acq_rel)) {
             m_owner->conns.fetch_sub(1, std::memory_order_relaxed);
         }
+        m_closed.store(true, std::memory_order_release);
     }
 
     // --- 空闲检查（HttpServer 的清理线程调用）---
@@ -379,6 +384,8 @@ private:
     /// 升级成 WebSocket 之后，字节不再进 HTTP 解析器。
     /// 原子：io 线程置位、sweeper 线程读（check_idle 的分支）。
     std::atomic<bool>                           m_is_ws{false};
+    /// on_close 里「已经减过 conns 计数」的闸（与 m_closed 分开，见 on_close）。
+    std::atomic<bool>                           m_counted{false};
     std::shared_ptr<detail::WsSessionImpl>      m_ws;
 
     std::shared_ptr<std::vector<char>>       m_read_buf;
@@ -420,6 +427,24 @@ private:
 namespace {
 
 /// IMF-fixdate：`Sun, 06 Nov 1994 08:49:37 GMT`
+/// 逗号列表里是否含某 token（大小写不敏感），用于应用自定义的 Connection 头。
+bool token_list_contains(std::string_view list, std::string_view token) noexcept
+{
+    std::size_t i = 0;
+    while (i <= list.size()) {
+        const std::size_t comma = list.find(',', i);
+        const std::size_t end   = (comma == std::string_view::npos) ? list.size() : comma;
+        if (httpmech::iequals(trim_ows(list.substr(i, end - i)), token)) {
+            return true;
+        }
+        if (comma == std::string_view::npos) {
+            break;
+        }
+        i = comma + 1;
+    }
+    return false;
+}
+
 void append_date_header(std::string& out)
 {
     std::time_t t = std::time(nullptr);
@@ -686,6 +711,12 @@ void ServerSession::dispatch_stream_events(span<const std::uint8_t> body, bool i
 
 void ServerSession::respond_protocol_error(Status code)
 {
+    // 已经发过响应（流式模式下头先发出去了）就没有"再回一个 400"的机会了：
+    // 只能直接断开，否则客户端会等一个永远不会结束的 body。
+    if (m_writer.sent || m_writer.aborted) {
+        close_now();
+        return;
+    }
     m_writer.reset_for_request(false);
     m_writer.code   = static_cast<std::uint16_t>(code);
     m_writer.reason = reason_phrase(code);
@@ -725,7 +756,7 @@ void ServerSession::finish_writer(bool keep_alive)
 
     const bool too_many = (cfg.max_requests_per_connection != 0 &&
                            m_served >= cfg.max_requests_per_connection);
-    const bool ka       = keep_alive && !too_many;
+    bool       ka       = keep_alive && !too_many;
 
     std::string wire;
     wire.reserve(256 + m_writer.body.size());
@@ -754,9 +785,19 @@ void ServerSession::finish_writer(bool keep_alive)
         wire.append("\r\n");
     }
 
-    wire.append("Connection: ");
-    wire.append(ka ? "keep-alive" : "close");
-    wire.append("\r\n");
+    // 应用自己设置了 Connection（例如提前要求 close）时不要再追加一个同名头；
+    // 值为 close 时还要按 close 收尾（以前只看请求的 keep_alive，应用的
+    // Connection: close 被完全忽略）。
+    const auto app_connection = m_writer.headers.get("Connection");
+    if (!app_connection.empty()) {
+        if (token_list_contains(app_connection, "close")) {
+            ka = false;
+        }
+    } else {
+        wire.append("Connection: ");
+        wire.append(ka ? "keep-alive" : "close");
+        wire.append("\r\n");
+    }
 
     for (std::size_t i = 0; i < m_writer.headers.size(); ++i) {
         wire.append(m_writer.headers.name_at(i));

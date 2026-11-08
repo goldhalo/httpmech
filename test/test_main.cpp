@@ -1170,6 +1170,231 @@ void test_websocket_protocol_error_closes_once()
     srv->stop();
 }
 
+
+// =============================================================================
+//  P1-2：服务端主动关闭（协议错误）后连接计数必须归零
+// =============================================================================
+void test_connection_count_after_protocol_error()
+{
+    g_case = "connection count after protocol error";
+
+    httpmech::ServerConfig cfg;
+    cfg.local       = {"127.0.0.1", 0};
+    cfg.emit_date   = false;
+    cfg.server_name = "httpmech-ut";
+
+    auto router = std::make_shared<httpmech::Router>();
+    router->get("/", [](const httpmech::HttpRequest&, httpmech::ResponseWriter& out) {
+        out.end();
+    });
+
+    auto srv = httpmech::HttpServer::create(cfg, router);
+    REQUIRE(srv != nullptr);
+    REQUIRE(!srv->start());
+    const std::uint16_t port = srv->local().port();
+    REQUIRE(port != 0);
+
+    const int fd = tcp_connect("127.0.0.1", port);
+    REQUIRE(fd >= 0);
+    REQUIRE(tcp_send_all(fd, "GARBAGE\r\n\r\n"));   // 非法请求行 → 400 + close
+
+    // 等连接被服务端收掉；以前 close_now() 先置 m_closed，on_close 不再减计数，
+    // connection_count() 永久停在 1。
+    bool zero = false;
+    for (int i = 0; i < 300; ++i) {
+        if (srv->connection_count() == 0) {
+            zero = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK(zero);
+
+    ::close(fd);
+    srv->stop();
+}
+
+// =============================================================================
+//  P2-4：64 位长度最高位为 1（RFC 6455 §5.2 禁止）→ 协议错误 1002
+// =============================================================================
+void test_ws_64bit_length_with_msb()
+{
+    g_case = "ws 64-bit length msb";
+
+    httpmech::ServerConfig cfg;
+    cfg.local       = {"127.0.0.1", 0};
+    cfg.emit_date   = false;
+    cfg.server_name = "httpmech-ut";
+
+    auto router = std::make_shared<httpmech::Router>();
+    httpmech::WebSocketHandlers ws;
+    ws.on_message = [](httpmech::WebSocketSession& s, httpmech::span<const std::uint8_t> d,
+                       bool) { s.send_binary(d); };
+    router->websocket("/ws", std::move(ws));
+
+    auto srv = httpmech::HttpServer::create(cfg, router);
+    REQUIRE(srv != nullptr);
+    REQUIRE(!srv->start());
+    const std::uint16_t port = srv->local().port();
+    REQUIRE(port != 0);
+
+    const int fd = tcp_connect("127.0.0.1", port);
+    REQUIRE(fd >= 0);
+    const std::string req =
+        "GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\n"
+        "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n";
+    REQUIRE(tcp_send_all(fd, req));
+
+    std::string head;
+    char        c = 0;
+    while (head.find("\r\n\r\n") == std::string::npos) {
+        if (!tcp_recv_exact(fd, &c, 1)) {
+            break;
+        }
+        head.push_back(c);
+    }
+    CHECK(head.rfind("HTTP/1.1 101", 0) == 0);
+
+    // 帧头：FIN|text、masked、长度=127、8 字节长度为 0x8000000000000000
+    std::string frame;
+    frame.push_back(static_cast<char>(0x81));
+    frame.push_back(static_cast<char>(0x80 | 127));
+    frame.push_back(static_cast<char>(0x80));   // 最高位 = 1
+    for (int i = 0; i < 7; ++i) {
+        frame.push_back(static_cast<char>(0));
+    }
+    const char mask[4] = {0x37, static_cast<char>(0xFA), 0x21, 0x3D};
+    frame.append(mask, 4);
+    REQUIRE(tcp_send_all(fd, frame));
+
+    std::uint8_t op = 0;
+    std::string  payload;
+    CHECK(ws_read_frame(fd, op, payload));
+    CHECK_EQ(static_cast<int>(op), 0x8);
+    if (payload.size() >= 2) {
+        CHECK_EQ(static_cast<int>((static_cast<std::uint8_t>(payload[0]) << 8) |
+                                  static_cast<std::uint8_t>(payload[1])),
+                 1002);
+    }
+
+    ::close(fd);
+    srv->stop();
+}
+
+// =============================================================================
+//  P2-5：max_message_bytes / max_frame_bytes = 0 表示「不限」
+// =============================================================================
+void test_ws_zero_limits_mean_unlimited()
+{
+    g_case = "ws zero limits";
+
+    httpmech::ServerConfig cfg;
+    cfg.local                    = {"127.0.0.1", 0};
+    cfg.emit_date                = false;
+    cfg.server_name              = "httpmech-ut";
+    cfg.websocket.max_message_bytes = 0;
+    cfg.websocket.max_frame_bytes   = 0;
+
+    auto router = std::make_shared<httpmech::Router>();
+    httpmech::WebSocketHandlers ws;
+    ws.on_message = [](httpmech::WebSocketSession& s, httpmech::span<const std::uint8_t> d,
+                       bool is_text) {
+        if (is_text) {
+            s.send_text(std::string_view{reinterpret_cast<const char*>(d.data()), d.size()});
+        } else {
+            s.send_binary(d);
+        }
+    };
+    router->websocket("/ws", std::move(ws));
+
+    auto srv = httpmech::HttpServer::create(cfg, router);
+    REQUIRE(srv != nullptr);
+    REQUIRE(!srv->start());
+    const std::uint16_t port = srv->local().port();
+    REQUIRE(port != 0);
+
+    const int fd = tcp_connect("127.0.0.1", port);
+    REQUIRE(fd >= 0);
+    const std::string req =
+        "GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\n"
+        "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n";
+    REQUIRE(tcp_send_all(fd, req));
+
+    std::string head;
+    char        c = 0;
+    while (head.find("\r\n\r\n") == std::string::npos) {
+        if (!tcp_recv_exact(fd, &c, 1)) {
+            break;
+        }
+        head.push_back(c);
+    }
+    CHECK(head.rfind("HTTP/1.1 101", 0) == 0);
+
+    REQUIRE(tcp_send_all(fd, ws_build_frame(0x1, "hi")));
+    std::uint8_t op = 0;
+    std::string  payload;
+    CHECK(ws_read_frame(fd, op, payload));
+    CHECK_EQ(static_cast<int>(op), 0x1);
+    CHECK_EQ(payload, std::string{"hi"});
+
+    ::close(fd);
+    srv->stop();
+}
+
+// =============================================================================
+//  P2-6：应用自己设置 Connection: close —— 不能出现两个同名头，且必须关连接
+// =============================================================================
+void test_response_connection_header_not_duplicated()
+{
+    g_case = "response Connection header";
+
+    httpmech::ServerConfig cfg;
+    cfg.local       = {"127.0.0.1", 0};
+    cfg.emit_date   = false;
+    cfg.server_name = "httpmech-ut";
+
+    auto router = std::make_shared<httpmech::Router>();
+    router->get("/", [](const httpmech::HttpRequest&, httpmech::ResponseWriter& out) {
+        out.set_header("Connection", "close");
+        out.write("bye");
+        out.end();
+    });
+
+    auto srv = httpmech::HttpServer::create(cfg, router);
+    REQUIRE(srv != nullptr);
+    REQUIRE(!srv->start());
+    const std::uint16_t port = srv->local().port();
+    REQUIRE(port != 0);
+
+    const int fd = tcp_connect("127.0.0.1", port);
+    REQUIRE(fd >= 0);
+    REQUIRE(tcp_send_all(fd, "GET / HTTP/1.1\r\nHost: t\r\n\r\n"));
+
+    std::string head;
+    char        c = 0;
+    while (head.find("\r\n\r\n") == std::string::npos) {
+        if (!tcp_recv_exact(fd, &c, 1)) {
+            break;
+        }
+        head.push_back(c);
+    }
+    REQUIRE(head.find("Connection: close") != std::string::npos);
+
+    // 同名头只能出现一次
+    std::size_t n = 0;
+    std::size_t pos = 0;
+    while ((pos = head.find("Connection:", pos)) != std::string::npos) {
+        ++n;
+        pos += 11;
+    }
+    CHECK_EQ(n, std::size_t{1});
+
+    ::close(fd);
+    srv->stop();
+}
+
 void test_server_e2e()
 {
     g_case = "server e2e";
@@ -1294,6 +1519,10 @@ int main()
         {"connection close",    test_connection_close_delivery},
         {"linger_zero guard",   test_linger_zero_guard},
         {"websocket e2e",       test_websocket_e2e},
+        {"connection count after protocol error", test_connection_count_after_protocol_error},
+        {"ws 64-bit length msb", test_ws_64bit_length_with_msb},
+        {"ws zero limits",       test_ws_zero_limits_mean_unlimited},
+        {"response Connection header", test_response_connection_header_not_duplicated},
         {"ws idle timeout",     test_websocket_idle_timeout_calls_on_close},
         {"ws protocol error on_close", test_websocket_protocol_error_closes_once},
         {"http client e2e",     test_http_client_e2e},

@@ -347,6 +347,9 @@ private:
         cb.size  = payload->size();
         m_pending.push_back(payload);
         if (!c->write(cb)) {
+            // write 返回 false = 没受理（反压），不会再有 on_write 来 pop ——
+            // 以前这个队列会按失败次数无限增长。
+            m_pending.pop_back();
             return false;
         }
         // close_after 由 `m_keep_alive` 在 finish() 里落实；以前这里还记了一个
@@ -738,6 +741,10 @@ struct WebSocketClient::Impl : public std::enable_shared_from_this<WebSocketClie
     std::shared_ptr<detail::WsSessionImpl> ws;
     Parser                                 parser{Parser::Role::client};
 
+    /// 帧层要求「这一帧写完就关传输」（close_after=true）。客户端没有服务端
+    /// 那套 m_close_after_all，这里自己记一个，在 on_write 里排空待写队列后关 conn。
+    std::atomic<bool> close_after_write{false};
+
     Ticker ticker{std::chrono::milliseconds(200)};
 
     void on_bytes(span<const std::uint8_t> data);
@@ -810,6 +817,16 @@ public:
         }
         if (ec) {
             m_owner->fail(ec);
+            return;
+        }
+        // 帧层要求 close_after（收到对端 close、回完 echo 后）：等本连接写全部
+        // 落地再关传输，避免把 close 帧吞掉（以前这个参数被直接忽略）。
+        if (m_owner->close_after_write.load(std::memory_order_acquire) &&
+            m_pending.empty()) {
+            m_owner->close_after_write.store(false, std::memory_order_release);
+            if (m_conn) {
+                m_conn->close();
+            }
         }
     }
 
@@ -941,10 +958,13 @@ void WebSocketClient::Impl::finish_handshake()
     detail::WsIo io;
     std::weak_ptr<Impl> weak = weak_from_this();
 
-    io.send = [weak](std::string wire, bool /*close_after*/) -> bool {
+    io.send = [weak](std::string wire, bool close_after) -> bool {
         auto o = weak.lock();
         if (!o || !o->conn) {
             return false;
+        }
+        if (close_after) {
+            o->close_after_write.store(true, std::memory_order_release);
         }
         // 保活靠 `ConstBuf.owner`：netmech 自己持有它直到这次写完成。
         //

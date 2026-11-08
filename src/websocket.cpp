@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cstring>
 #include <random>
+#include <limits>
 #include <string_view>
 #include <chrono>
 #include <cstddef>
@@ -387,7 +388,18 @@ void WsSessionImpl::feed_one_frame(std::error_code& ec)
         for (int i = 0; i < 8; ++i) {
             len = (len << 8) | p[off + i];
         }
+        // RFC 6455 §5.2：64 位长度最高位必须为 0。不校验的话后续
+        // `off + key_len + len` 会回绕，按超大长度构造 std::string 直接崩。
+        if ((len & 0x8000000000000000ULL) != 0) {
+            ec = make_error_code(Errc::bad_chunk);
+            return;
+        }
         off += 8;
+    }
+    // 即便上限配成 0（不限），也要防 size_t 加法回绕。
+    if (len > (std::numeric_limits<std::size_t>::max)() - 16) {
+        ec = make_error_code(Errc::bad_chunk);
+        return;
     }
 
     const bool is_control = (opcode & 0x08) != 0;
@@ -500,7 +512,8 @@ void WsSessionImpl::feed_one_frame(std::error_code& ec)
             m_in_fragment = true;
             m_msg_is_text = (opcode == kOpText);
             m_msg         = std::move(data);
-            if (m_msg.size() > m_cfg.max_message_bytes) {
+            // 0 = 不限（与 max_frame_bytes / send_* 的语义一致）
+            if (m_cfg.max_message_bytes != 0 && m_msg.size() > m_cfg.max_message_bytes) {
                 protocol_error(static_cast<std::uint16_t>(WsCloseCode::message_too_big),
                                "message too big");
             }
@@ -513,7 +526,7 @@ void WsSessionImpl::feed_one_frame(std::error_code& ec)
             ec = make_error_code(Errc::bad_chunk);   // 没有起始帧
             return;
         }
-        if (m_msg.size() + data.size() > m_cfg.max_message_bytes) {
+        if (m_cfg.max_message_bytes != 0 && m_msg.size() + data.size() > m_cfg.max_message_bytes) {
             protocol_error(static_cast<std::uint16_t>(WsCloseCode::message_too_big),
                            "message too big");
             return;
