@@ -11,10 +11,13 @@
 //    · Buf 由我们提供，回调里原样传回，所以每连接一块读缓冲就够用；
 //    · 解析器会把收到的字节**拷进自己的缓冲**，所以读缓冲可以立刻复用。
 //
-//  v0.1 的取舍：响应整块缓冲后按 Content-Length 发。
-//    头文件里提到的"超 max_buffered_response 自动 chunked"尚未实现 ——
-//    它要求 header 在第一次 write 时就落地，属于流式响应，下一阶段再做。
-//    当前行为：响应全部缓存，end() 时一次算出长度发出。对 JSON 接口足够。
+//  响应写出：
+//    · 默认整块缓冲，end() 时按 Content-Length 一次发出（JSON 接口足够）；
+//    · 累计写入超过 ServerConfig::max_buffered_response 时自动切
+//      Transfer-Encoding: chunked（ResponseWriter::write →
+//      ServerSession::start_stream_response / send_stream_chunk /
+//      finish_stream_response）：之后每次 write 直接发一个 chunk，end() 发 0 块。
+//    · HEAD / 1xx / 204 / 304 不切流式（它们本来就没有 body）。
 // =============================================================================
 #include <httpmech/server.hpp>
 
@@ -84,6 +87,8 @@ struct ResponseWriter::Impl {
     bool                   aborted  = false;
     bool                   upgraded = false;
     bool                   no_body  = false;   ///< HEAD：算长度但不发体
+    bool                   chunked  = false;   ///< 已切 chunked 流式
+    bool                   stream_ended = false;
 
     void reset_for_request(bool head_request)
     {
@@ -97,6 +102,8 @@ struct ResponseWriter::Impl {
         aborted  = false;
         upgraded = false;
         no_body  = head_request;
+        chunked  = false;
+        stream_ended = false;
     }
 };
 
@@ -355,6 +362,8 @@ public:
     }
 
 private:
+    friend class httpmech::ResponseWriter;   // 流式响应直接调 start/send_stream_chunk
+
     static constexpr std::size_t kReadChunk = 16 * 1024;
 
     static httpmech::Parser::Config make_parser_cfg(const ServerConfig& cfg)
@@ -372,6 +381,12 @@ private:
     void dispatch_stream_events(span<const std::uint8_t> body, bool is_end);
     void respond_protocol_error(Status code);
     void finish_writer(bool keep_alive);
+    void reset_for_next_request(bool keep_alive);
+    /// 超过 ServerConfig::max_buffered_response：先把响应头按 chunked 发出去。
+    bool start_stream_response();
+    bool send_stream_chunk(span<const std::uint8_t> data);
+    /// 发 0 长度块收尾（end() 调用）。
+    void finish_stream_response();
 
     std::shared_ptr<HttpServer::Impl> m_owner;
     std::shared_ptr<netmech::Conn>    m_conn;
@@ -724,8 +739,149 @@ void ServerSession::respond_protocol_error(Status code)
     finish_writer(false);
 }
 
+bool ServerSession::start_stream_response()
+{
+    if (m_writer.sent || m_writer.aborted) {
+        return false;
+    }
+    const ServerConfig& cfg = m_owner->cfg;
+
+    if (!m_writer.reason.empty()) {
+        // 应用自定义原因短语
+    } else {
+        m_writer.reason = reason_phrase(status_from(m_writer.code));
+    }
+
+    const bool too_many = (cfg.max_requests_per_connection != 0 &&
+                           m_served >= cfg.max_requests_per_connection);
+    bool       ka       = (m_writer.request != nullptr) && m_writer.request->keep_alive && !too_many;
+    const auto app_connection = m_writer.headers.get("Connection");
+    if (!app_connection.empty() && token_list_contains(app_connection, "close")) {
+        ka = false;
+    }
+
+    std::string wire;
+    wire.reserve(256);
+    wire.append("HTTP/1.1 ");
+    wire.append(std::to_string(m_writer.code));
+    wire.push_back(' ');
+    wire.append(m_writer.reason.empty() ? "OK" : m_writer.reason);
+    wire.append("\r\n");
+
+    if (!cfg.server_name.empty() && !m_writer.headers.has("Server")) {
+        wire.append("Server: ");
+        wire.append(cfg.server_name);
+        wire.append("\r\n");
+    }
+    if (cfg.emit_date && !m_writer.headers.has("Date")) {
+        wire.append("Date: ");
+        append_date_header(wire);
+        wire.append("\r\n");
+    }
+    // chunked 与 Content-Length 互斥
+    wire.append("Transfer-Encoding: chunked\r\n");
+    if (app_connection.empty()) {
+        wire.append("Connection: ");
+        wire.append(ka ? "keep-alive" : "close");
+        wire.append("\r\n");
+    }
+    for (std::size_t i = 0; i < m_writer.headers.size(); ++i) {
+        wire.append(m_writer.headers.name_at(i));
+        wire.append(": ");
+        wire.append(m_writer.headers.value_at(i));
+        wire.append("\r\n");
+    }
+    wire.append("\r\n");
+
+    m_writer.sent    = true;
+    m_writer.chunked = true;
+    if (!send(std::move(wire), false)) {
+        m_writer.aborted = true;
+        close_now();
+        return false;
+    }
+    // 之前攒下的 body 作为第一个块
+    if (!m_writer.body.empty()) {
+        const std::string first = std::move(m_writer.body);
+        m_writer.body.clear();
+        if (!send_stream_chunk(span<const std::uint8_t>{
+                reinterpret_cast<const std::uint8_t*>(first.data()), first.size()})) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ServerSession::send_stream_chunk(span<const std::uint8_t> data)
+{
+    if (data.empty()) {
+        return true;
+    }
+    std::string chunk;
+    chunk.reserve(data.size() + 16);
+    // 十六进制长度
+    char        hex[17];
+    std::size_t n = 0;
+    std::size_t v = data.size();
+    do {
+        const unsigned d = static_cast<unsigned>(v & 0xF);
+        hex[n++] = static_cast<char>(d < 10 ? ('0' + d) : ('a' + d - 10));
+        v >>= 4;
+    } while (v != 0);
+    for (std::size_t i = 0; i < n / 2; ++i) {
+        std::swap(hex[i], hex[n - 1 - i]);
+    }
+    chunk.append(hex, n);
+    chunk.append("\r\n");
+    chunk.append(reinterpret_cast<const char*>(data.data()), data.size());
+    chunk.append("\r\n");
+    if (!send(std::move(chunk), false)) {
+        m_writer.aborted = true;
+        close_now();
+        return false;
+    }
+    return true;
+}
+
+void ServerSession::finish_stream_response()
+{
+    if (m_writer.stream_ended || m_writer.aborted) {
+        return;
+    }
+    m_writer.stream_ended = true;
+    const ServerConfig& cfg = m_owner->cfg;
+    const bool too_many = (cfg.max_requests_per_connection != 0 &&
+                           m_served >= cfg.max_requests_per_connection);
+    bool       ka       = (m_writer.request != nullptr) && m_writer.request->keep_alive && !too_many;
+    const auto app_connection = m_writer.headers.get("Connection");
+    if (!app_connection.empty() && token_list_contains(app_connection, "close")) {
+        ka = false;
+    }
+    send(std::string("0\r\n\r\n"), !ka);
+}
+
+/// keep-alive 收尾：解析器与 writer 复位（HTTP/1.0 或 close 时只清状态）。
+void ServerSession::reset_for_next_request(bool keep_alive)
+{
+    if (keep_alive && !m_is_ws.load(std::memory_order_acquire)) {
+        m_parser.reset();
+        m_writer.reset_for_request(false);
+        m_stream_headers_done = false;
+        m_req_headers_done.store(false, std::memory_order_release);
+        m_request_start_ns.store(0, std::memory_order_relaxed);
+    }
+}
+
 void ServerSession::finish_writer(bool keep_alive)
 {
+    if (m_writer.stream_ended) {
+        // end() 里已经发过 0 块；这里只负责把连接复位（或让它按 close 收尾）。
+        const ServerConfig& cfg = m_owner->cfg;
+        const bool too_many = (cfg.max_requests_per_connection != 0 &&
+                               m_served >= cfg.max_requests_per_connection);
+        reset_for_next_request(keep_alive && !too_many);
+        return;
+    }
     if (m_writer.sent || m_writer.aborted) {
         return;
     }
@@ -816,14 +972,7 @@ void ServerSession::finish_writer(bool keep_alive)
     }
 
     // 为下一条请求做准备（keep-alive）。升级成 WebSocket 之后不适用。
-    if (ka && !m_is_ws.load(std::memory_order_acquire)) {
-        m_parser.reset();
-        m_writer.reset_for_request(false);
-        m_stream_headers_done = false;
-        // 下一条请求重新开始计时（否则 header_timeout 会把上一条的时长算进来）
-        m_req_headers_done.store(false, std::memory_order_release);
-        m_request_start_ns.store(0, std::memory_order_relaxed);
-    }
+    reset_for_next_request(ka);
 }
 
 bool ServerSession::switch_to_websocket(WebSocketHandlers handlers, WebSocketConfig wcfg,
@@ -1172,11 +1321,31 @@ void ResponseWriter::add_header(std::string_view name, std::string_view value)
 
 bool ResponseWriter::write(span<const std::uint8_t> data)
 {
-    if (m_impl->sent || m_impl->aborted) {
+    if (m_impl->aborted || m_impl->stream_ended) {
         return false;
     }
-    m_impl->body.append(reinterpret_cast<const char*>(data.data()), data.size());
-    return true;
+    if (!m_impl->sent) {
+        // 还没发头：攒到 ServerConfig::max_buffered_response 就切 chunked 流式
+        //（头文件承诺的行为；以前这里没有实现，大响应会整体驻留内存）。
+        const bool no_content = (m_impl->code == 204 || m_impl->code == 304 ||
+                                 (m_impl->code >= 100 && m_impl->code < 200));
+        const bool body_allowed = !m_impl->no_body && !no_content;
+        const auto& cfg = m_impl->session->cfg();
+        if (body_allowed && cfg.max_buffered_response != 0 &&
+            m_impl->body.size() + data.size() > cfg.max_buffered_response) {
+            if (!m_impl->session->start_stream_response()) {
+                return false;
+            }
+        } else {
+            m_impl->body.append(reinterpret_cast<const char*>(data.data()), data.size());
+            return true;
+        }
+    }
+    // 已切 chunked：直接作为一个块发出
+    if (m_impl->chunked) {
+        return m_impl->session->send_stream_chunk(data);
+    }
+    return false;
 }
 
 bool ResponseWriter::write(std::string_view text)
@@ -1187,6 +1356,11 @@ bool ResponseWriter::write(std::string_view text)
 
 void ResponseWriter::end()
 {
+    if (m_impl->chunked) {
+        m_impl->session->finish_stream_response();
+        m_impl->ended = true;
+        return;
+    }
     if (m_impl->sent || m_impl->aborted) {
         return;
     }

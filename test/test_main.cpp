@@ -1466,6 +1466,83 @@ void test_runtime_injection()
     CHECK(!rt->running());
 }
 
+
+// =============================================================================
+//  P2-：超过 max_buffered_response 自动切 Transfer-Encoding: chunked
+//       （头文件一直这么承诺，但实现里此前没有流式路径）
+// =============================================================================
+void test_response_chunked_streaming()
+{
+    g_case = "response chunked streaming";
+
+    httpmech::ServerConfig cfg;
+    cfg.local                 = {"127.0.0.1", 0};
+    cfg.emit_date             = false;
+    cfg.server_name           = "httpmech-ut";
+    cfg.max_buffered_response = 64;   // 测试用：很小的阈值
+
+    auto router = std::make_shared<httpmech::Router>();
+    router->get("/big", [](const httpmech::HttpRequest&, httpmech::ResponseWriter& out) {
+        const std::string piece(100, 'a');
+        for (int i = 0; i < 5; ++i) {
+            CHECK(out.write(piece));
+        }
+        out.end();
+    });
+
+    auto srv = httpmech::HttpServer::create(cfg, router);
+    REQUIRE(srv != nullptr);
+    REQUIRE(!srv->start());
+    const std::uint16_t port = srv->local().port();
+    REQUIRE(port != 0);
+
+    const int fd = tcp_connect("127.0.0.1", port);
+    REQUIRE(fd >= 0);
+    REQUIRE(tcp_send_all(fd, "GET /big HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"));
+
+    std::string resp;
+    char        buf[4096];
+    for (;;) {
+        const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+        if (n > 0) {
+            resp.append(buf, static_cast<std::size_t>(n));
+            continue;
+        }
+        break;
+    }
+    ::close(fd);
+
+    const std::size_t head_end = resp.find("\r\n\r\n");
+    REQUIRE(head_end != std::string::npos);
+    const std::string head = resp.substr(0, head_end + 4);
+    CHECK(head.find("Transfer-Encoding: chunked") != std::string::npos);
+    CHECK(head.find("Content-Length:") == std::string::npos);
+
+    // 手工解 chunked
+    std::string body;
+    std::size_t pos = head_end + 4;
+    bool        ok  = false;
+    for (;;) {
+        const auto eol = resp.find("\r\n", pos);
+        if (eol == std::string::npos) {
+            break;
+        }
+        const std::size_t sz = static_cast<std::size_t>(
+            std::stoul(resp.substr(pos, eol - pos), nullptr, 16));
+        pos = eol + 2;
+        if (sz == 0) {
+            ok = true;
+            break;
+        }
+        REQUIRE(pos + sz + 2 <= resp.size());
+        body.append(resp, pos, sz);
+        pos += sz + 2;
+    }
+    CHECK(ok);
+    CHECK_EQ(body.size(), std::size_t{500});
+    CHECK(body == std::string(500, 'a'));
+}
+
 void test_server_e2e()
 {
     g_case = "server e2e";
@@ -1588,6 +1665,7 @@ int main()
 #if !defined(_WIN32)
         {"server e2e",          test_server_e2e},
         {"connection close",    test_connection_close_delivery},
+        {"response chunked streaming", test_response_chunked_streaming},
         {"linger_zero guard",   test_linger_zero_guard},
         {"websocket e2e",       test_websocket_e2e},
         {"connection count after protocol error", test_connection_count_after_protocol_error},
