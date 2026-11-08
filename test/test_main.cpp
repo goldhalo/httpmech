@@ -337,6 +337,62 @@ void test_status()
 // =============================================================================
 //  端到端：起一个真服务端，用阻塞 socket 发真请求
 // =============================================================================
+// =============================================================================
+//  Parser：Content-Length / Transfer-Encoding 的三态校验
+//
+//  以前非法 CL、冲突 CL、TE 非 chunked 全都被当成「没有 body」静默放行，
+//  剩余字节会被当成下一条请求（请求走私面，RFC 9112 §6.3 要求 400）。
+// =============================================================================
+void test_parser_length_validation()
+{
+    g_case = "invalid content-length";
+    {
+        httpmech::Parser p{httpmech::Parser::Role::server};
+        std::error_code ec;
+        p.feed(bytes("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: abc\r\n\r\n"), ec);
+        CHECK_EQ(ec, httpmech::make_error_code(httpmech::Errc::bad_content_length));
+    }
+    g_case = "conflicting content-length";
+    {
+        httpmech::Parser p{httpmech::Parser::Role::server};
+        std::error_code ec;
+        p.feed(bytes("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n"
+                     "Content-Length: 10\r\n\r\nhellohello"),
+               ec);
+        CHECK_EQ(ec, httpmech::make_error_code(httpmech::Errc::bad_content_length));
+    }
+    g_case = "duplicate identical content-length";
+    {
+        httpmech::Parser p{httpmech::Parser::Role::server};
+        std::error_code ec;
+        p.feed(bytes("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n"
+                     "Content-Length: 5\r\n\r\nhello"),
+               ec);
+        CHECK(!ec);
+        CHECK_EQ(p.messages(), std::uint64_t{1});
+        CHECK_EQ(p.request().body.size(), std::size_t{5});
+    }
+    g_case = "transfer-encoding without final chunked";
+    {
+        httpmech::Parser p{httpmech::Parser::Role::server};
+        std::error_code ec;
+        p.feed(bytes("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n\r\n"), ec);
+        CHECK_EQ(ec, httpmech::make_error_code(httpmech::Errc::unsupported_transfer_coding));
+    }
+    g_case = "transfer-encoding across fields";
+    {
+        httpmech::Parser p{httpmech::Parser::Role::server};
+        std::error_code ec;
+        p.feed(bytes("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n"
+                     "Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"),
+               ec);
+        CHECK(!ec);
+        CHECK_EQ(p.messages(), std::uint64_t{1});
+        CHECK_EQ(p.request().body.size(), std::size_t{5});
+    }
+}
+
+
 #if !defined(_WIN32)
 
 int tcp_connect(const char* ip, std::uint16_t port)
@@ -1040,61 +1096,6 @@ void test_websocket_e2e()
     srv->stop();
 }
 
-
-// =============================================================================
-//  Parser：Content-Length / Transfer-Encoding 的三态校验
-//
-//  以前非法 CL、冲突 CL、TE 非 chunked 全都被当成「没有 body」静默放行，
-//  剩余字节会被当成下一条请求（请求走私面，RFC 9112 §6.3 要求 400）。
-// =============================================================================
-void test_parser_length_validation()
-{
-    g_case = "invalid content-length";
-    {
-        httpmech::Parser p{httpmech::Parser::Role::server};
-        std::error_code ec;
-        p.feed(bytes("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: abc\r\n\r\n"), ec);
-        CHECK_EQ(ec, httpmech::make_error_code(httpmech::Errc::bad_content_length));
-    }
-    g_case = "conflicting content-length";
-    {
-        httpmech::Parser p{httpmech::Parser::Role::server};
-        std::error_code ec;
-        p.feed(bytes("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n"
-                     "Content-Length: 10\r\n\r\nhellohello"),
-               ec);
-        CHECK_EQ(ec, httpmech::make_error_code(httpmech::Errc::bad_content_length));
-    }
-    g_case = "duplicate identical content-length";
-    {
-        httpmech::Parser p{httpmech::Parser::Role::server};
-        std::error_code ec;
-        p.feed(bytes("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n"
-                     "Content-Length: 5\r\n\r\nhello"),
-               ec);
-        CHECK(!ec);
-        CHECK_EQ(p.messages(), std::uint64_t{1});
-        CHECK_EQ(p.request().body.size(), std::size_t{5});
-    }
-    g_case = "transfer-encoding without final chunked";
-    {
-        httpmech::Parser p{httpmech::Parser::Role::server};
-        std::error_code ec;
-        p.feed(bytes("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n\r\n"), ec);
-        CHECK_EQ(ec, httpmech::make_error_code(httpmech::Errc::unsupported_transfer_coding));
-    }
-    g_case = "transfer-encoding across fields";
-    {
-        httpmech::Parser p{httpmech::Parser::Role::server};
-        std::error_code ec;
-        p.feed(bytes("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n"
-                     "Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"),
-               ec);
-        CHECK(!ec);
-        CHECK_EQ(p.messages(), std::uint64_t{1});
-        CHECK_EQ(p.request().body.size(), std::size_t{5});
-    }
-}
 
 // =============================================================================
 //  WS：协议错误（RSV 非 0）必须回调 on_close，且恰好一次
