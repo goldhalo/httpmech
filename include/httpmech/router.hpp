@@ -22,6 +22,8 @@
 // =============================================================================
 #pragma once
 
+#include "httpmech/export.hpp"
+
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -71,7 +73,7 @@ namespace httpmech {
 /// @par 线程
 /// 注册接口（`get` / `post` / `before` …）**必须在 `HttpServer::start()` 之前**
 /// 调完，之后只读。运行期不再加锁 —— 路由表是启动期配置，不是运行期状态。
-class Router : public RequestHandler,
+class HTTPMECH_API Router : public RequestHandler,
                public std::enable_shared_from_this<Router> {
 public:
     /// 处理函数。`out` 必须以 `end()` 或 `upgrade_websocket()` 收尾。

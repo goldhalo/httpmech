@@ -13,6 +13,8 @@
 // =============================================================================
 #pragma once
 
+#include "httpmech/export.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
@@ -42,16 +44,16 @@ enum class Method : std::uint8_t {
 };
 
 /// 枚举 → 规范大写文本（"GET" / "DELETE" ...）。`unknown` 返回 "UNKNOWN"。
-[[nodiscard]] const char* to_string(Method m) noexcept;
+[[nodiscard]] HTTPMECH_API const char* to_string(Method m) noexcept;
 
 /// 文本 → 枚举，大小写敏感（HTTP 方法就是大写）。不认识返回 `Method::unknown`。
-[[nodiscard]] Method method_from(std::string_view text) noexcept;
+[[nodiscard]] HTTPMECH_API Method method_from(std::string_view text) noexcept;
 
 /// 该方法的请求能否带消息体（GET/HEAD/DELETE/OPTIONS/TRACE/CONNECT 一般为否）。
 ///
 /// @note 只是**提示**：解析器不据此拒绝带体的 GET —— 现实里真有这种请求，
 ///       严格拒绝会互通性变差。要不要处理由应用决定。
-[[nodiscard]] bool method_allows_body(Method m) noexcept;
+[[nodiscard]] HTTPMECH_API bool method_allows_body(Method m) noexcept;
 
 // =============================================================================
 //  版本
@@ -64,7 +66,7 @@ enum class Version : std::uint8_t {
 };
 
 /// "HTTP/1.1" 这种文本。`unknown` 返回 "HTTP/1.1"（保守假设）。
-[[nodiscard]] const char* to_string(Version v) noexcept;
+[[nodiscard]] HTTPMECH_API const char* to_string(Version v) noexcept;
 
 // =============================================================================
 //  状态码
@@ -118,11 +120,11 @@ enum class Status : std::uint16_t {
 
 /// 数字 → 枚举。认识的返回对应值，不认识的返回 `Status::other`
 /// （此时请从 `HttpResponse::status_code` 取原始数字）。
-[[nodiscard]] Status status_from(std::uint16_t code) noexcept;
+[[nodiscard]] HTTPMECH_API Status status_from(std::uint16_t code) noexcept;
 
 /// 标准原因短语（"Not Found"）。`Status::other` 返回 ""，
 /// 自定义短语请用 `HttpResponse::reason`。
-[[nodiscard]] const char* reason_phrase(Status s) noexcept;
+[[nodiscard]] HTTPMECH_API const char* reason_phrase(Status s) noexcept;
 
 [[nodiscard]] constexpr bool is_informational(Status s) noexcept { return static_cast<std::uint16_t>(s) < 200; }
 [[nodiscard]] constexpr bool is_success(Status s) noexcept       { return static_cast<std::uint16_t>(s) >= 200 && static_cast<std::uint16_t>(s) < 300; }
@@ -194,9 +196,9 @@ enum class Errc {
 };
 
 /// 错误码类别。`std::error_code{e, httpmech::error_category()}`。
-[[nodiscard]] const std::error_category& error_category() noexcept;
+[[nodiscard]] HTTPMECH_API const std::error_category& error_category() noexcept;
 
-[[nodiscard]] std::error_code make_error_code(Errc e) noexcept;
+[[nodiscard]] HTTPMECH_API std::error_code make_error_code(Errc e) noexcept;
 
 } // namespace httpmech
 

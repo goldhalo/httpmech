@@ -8,6 +8,7 @@
 #pragma once
 
 #include <atomic>
+#include <mutex>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -100,6 +101,9 @@ private:
     /// 发 close 帧（写完关传输）+ 带真实 code 通知应用，恰好一次。
     /// 协议错误与空闲超时共用；返回后状态为 closed。
     void        close_with_frame(std::uint16_t code, std::string_view why);
+
+    /// 尝试把 close 帧发出去；失败时区分「反压（留 tick 重试）」与「传输已死」。
+    bool        try_send_close_frame();
     void        protocol_error(std::uint16_t code, std::string_view why);
 
     Role                               m_role;
@@ -121,6 +125,10 @@ private:
     // 所以一律用原子量，而不是"靠调用方保证单线程"。
     std::atomic<State>   m_state{State::open};
     std::atomic<bool>    m_close_sent{false};
+    std::atomic<bool>    m_close_frame_sent{false};
+    /// close 帧载荷（close() 写入、tick 重试读取），受 m_close_mu 保护。
+    std::mutex           m_close_mu;
+    std::string          m_close_payload;
     /// 原子：io 线程自增，应用可能在别的线程读（`messages_received()`）。
     std::atomic<std::uint64_t> m_recv_msgs{0};
 

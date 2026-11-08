@@ -22,6 +22,8 @@
 // =============================================================================
 #pragma once
 
+#include "httpmech/export.hpp"
+
 #include <cstdint>
 #include <memory>
 #include <system_error>
@@ -48,7 +50,7 @@ namespace httpmech {
 /// @par 线程模型
 /// 非线程安全。一个连接一个 Parser，只在该连接的 io 线程上用 —— 这与
 /// netmech "同一连接的回调串行" 的契约天然吻合，不需要加锁。
-class Parser {
+class HTTPMECH_API Parser {
 public:
     enum class Role : std::uint8_t {
         server,   ///< 解析请求（server → 收请求行）

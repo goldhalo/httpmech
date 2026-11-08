@@ -301,6 +301,37 @@ jobs:
   # ---------------------------------------------------------------------------
   # 质量门禁
   # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # 共享库构建（-DHTTPMECH_LIBRARY_TYPE=SHARED）
+  # ---------------------------------------------------------------------------
+  shared:
+    name: Linux / gcc / Shared
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 安装工具
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++
+
+      - name: 配置（Debug + SHARED）
+        run: |
+          export CC=gcc CXX=g++
+          cmake -S . -B build-shared -G Ninja \
+                -DCMAKE_BUILD_TYPE=Debug \
+                -DHTTPMECH_LIBRARY_TYPE=SHARED \
+                -DHTTPMECH_WARNINGS_AS_ERRORS=ON
+
+      - name: 构建
+        run: cmake --build build-shared --parallel
+
+      - name: 测试（链接 libhttpmech.so）
+        run: ctest --test-dir build-shared --output-on-failure --timeout 180
+
   quality:
     name: 质量检查
     runs-on: ubuntu-latest

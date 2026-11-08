@@ -259,12 +259,38 @@ void WsSessionImpl::close(std::uint16_t code, std::string_view reason)
         kOpClose, true,
         span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(payload.data()),
                                  payload.size()});
-    if (!sent) {
-        // close 帧根本没发出去：握手已经不可能完成，直接断，别让应用干等 2 秒。
-        fail_transport();
-        return;
+    // close 帧先尝试发一次；失败可能是**正常反压**（发送队列满），也可能是
+    // 传输已经死了。前者留给 tick 重试，后者走 fail_transport —— 以前一律
+    // 当致命，反压时应用会收到一个莫名的 abnormal 关闭。
+    (void)sent;
+    {
+        std::lock_guard<std::mutex> lk(m_close_mu);
+        m_close_payload = payload;
     }
+    m_close_frame_sent.store(false, std::memory_order_release);
     m_close_deadline_ns.store(now_ns() + 2'000'000'000LL, std::memory_order_release);
+    try_send_close_frame();
+}
+
+bool WsSessionImpl::try_send_close_frame()
+{
+    std::string payload;
+    {
+        std::lock_guard<std::mutex> lk(m_close_mu);
+        payload = m_close_payload;
+    }
+    const bool sent = send_frame(
+        kOpClose, true,
+        span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(payload.data()),
+                                 payload.size()});
+    if (sent) {
+        m_close_frame_sent.store(true, std::memory_order_release);
+        return true;
+    }
+    if (m_io.is_closed && m_io.is_closed()) {
+        fail_transport();   // 传输确实没了：通知 abnormal
+    }
+    return false;           // 反压：留给 tick 重试
 }
 
 void WsSessionImpl::protocol_error(std::uint16_t code, std::string_view why)
@@ -575,6 +601,16 @@ void WsSessionImpl::tick(std::chrono::steady_clock::time_point now)
     }
     const std::int64_t now_ns_v =
         std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+
+    // close 帧因反压没发出去：在 2 秒窗口内重试，别让关闭握手卡死。
+    if (m_state.load(std::memory_order_acquire) == State::closing &&
+        !m_close_frame_sent.load(std::memory_order_acquire) &&
+        m_close_deadline_ns.load(std::memory_order_acquire) != 0) {
+        try_send_close_frame();
+        if (m_state.load(std::memory_order_acquire) == State::closed) {
+            return;   // fail_transport 已经收口
+        }
+    }
 
     // 关闭握手的兜底：发了 close 但对方不回，2 秒后强关
     const std::int64_t dl = m_close_deadline_ns.load(std::memory_order_acquire);

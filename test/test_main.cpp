@@ -3,6 +3,8 @@
 // =============================================================================
 #include <httpmech/httpmech.hpp>
 
+#include <netmech/runtime.hpp>
+
 // 只有 linger_zero 那个用例需要直接构造 netmech 的 Mechanism
 #include <netmech/mechanism.hpp>
 
@@ -1410,6 +1412,60 @@ void test_response_connection_header_not_duplicated()
     srv->stop();
 }
 
+
+// =============================================================================
+//  Runtime 注入：server 与 HttpClient 共用一份应用指定的 io 运行时
+// =============================================================================
+void test_runtime_injection()
+{
+    g_case = "runtime injection";
+
+    netmech::Runtime::Options opt;
+    opt.io_threads = 1;
+    auto rt = netmech::Runtime::create(opt);
+    REQUIRE(rt != nullptr);
+
+    httpmech::ServerConfig scfg;
+    scfg.local       = {"127.0.0.1", 0};
+    scfg.emit_date   = false;
+    scfg.server_name = "httpmech-ut";
+    scfg.runtime     = rt;
+
+    auto router = std::make_shared<httpmech::Router>();
+    router->get("/", [](const httpmech::HttpRequest&, httpmech::ResponseWriter& out) {
+        out.write("ok");
+        out.end();
+    });
+
+    auto srv = httpmech::HttpServer::create(scfg, router);
+    REQUIRE(srv != nullptr);
+    REQUIRE(!srv->start());
+
+    httpmech::ClientConfig ccfg;
+    ccfg.remote  = {"127.0.0.1", srv->local().port()};
+    ccfg.runtime = rt;
+
+    auto cli = httpmech::HttpClient::create(ccfg);
+    REQUIRE(cli != nullptr);
+
+    auto w = std::make_shared<Waiter>();
+    auto h = std::make_shared<SyncHandler>(w);
+    httpmech::RequestSpec spec;
+    spec.target = "/";
+    REQUIRE(cli->request(std::move(spec), h));
+    REQUIRE(w->wait());
+    CHECK(!h->ec);
+    CHECK_EQ(static_cast<int>(h->status), 200);
+    CHECK_EQ(h->body, std::string{"ok"});
+    CHECK(rt->running());
+    CHECK_EQ(rt->io_threads(), std::size_t{1});
+
+    cli->close();
+    srv->stop();
+    rt->shutdown();
+    CHECK(!rt->running());
+}
+
 void test_server_e2e()
 {
     g_case = "server e2e";
@@ -1541,6 +1597,7 @@ int main()
         {"ws idle timeout",     test_websocket_idle_timeout_calls_on_close},
         {"ws protocol error on_close", test_websocket_protocol_error_closes_once},
         {"http client e2e",     test_http_client_e2e},
+        {"runtime injection",   test_runtime_injection},
         {"http client chunked", test_http_client_chunked},
         {"websocket client e2e", test_websocket_client_e2e},
 #endif

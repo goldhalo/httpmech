@@ -649,7 +649,8 @@ HttpClient::~HttpClient()
 
 std::shared_ptr<HttpClient> HttpClient::create(ClientConfig cfg)
 {
-    return create_with_mechanism(netmech::Mechanism::create(), std::move(cfg));
+    auto mech = netmech::Mechanism::create(netmech::Mechanism::Config{}, cfg.runtime);
+    return create_with_mechanism(std::move(mech), std::move(cfg));
 }
 
 std::shared_ptr<HttpClient> HttpClient::create_with_mechanism(
@@ -1071,7 +1072,8 @@ WebSocketClient::~WebSocketClient()
 
 std::shared_ptr<WebSocketClient> WebSocketClient::create(WebSocketClientConfig cfg)
 {
-    return create_with_mechanism(netmech::Mechanism::create(), std::move(cfg));
+    auto mech = netmech::Mechanism::create(netmech::Mechanism::Config{}, cfg.runtime);
+    return create_with_mechanism(std::move(mech), std::move(cfg));
 }
 
 std::shared_ptr<WebSocketClient> WebSocketClient::create_with_mechanism(

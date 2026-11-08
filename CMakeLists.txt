@@ -66,6 +66,17 @@ if(NOT EXISTS "${HTTPMECH_NETMECH_DIR}/CMakeLists.txt")
         "   指定：cmake -DHTTPMECH_NETMECH_DIR=<netmech 路径> ...")
 endif()
 
+# 库类型：STATIC（默认）/ SHARED。
+#
+# ★ 必须在 add_subdirectory(netmech) 之前定义：SHARED 构建要求 netmech 也
+#   以共享库提供 —— 只静态链 netmech 会让注入的 Runtime 跨两份副本使用
+#   （netmech 文档明确禁止，rtspmech 里实测段错误）。
+set(HTTPMECH_LIBRARY_TYPE "STATIC" CACHE STRING "库类型：STATIC 或 SHARED")
+set_property(CACHE HTTPMECH_LIBRARY_TYPE PROPERTY STRINGS STATIC SHARED)
+if(HTTPMECH_LIBRARY_TYPE STREQUAL "SHARED")
+    set(NETMECH_LIBRARY_TYPE "SHARED" CACHE STRING "netmech 库类型" FORCE)
+endif()
+
 set(NETMECH_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 set(NETMECH_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 
@@ -106,14 +117,14 @@ endif()
 # ---------------------------------------------------------------------------
 # 6. 主库
 # ---------------------------------------------------------------------------
-#  头文件先于实现落地（本仓当前是 v0.1 接口草案）。src/ 下还没有 .cpp 时
+#  头文件先于实现落地。
 #  构建成 INTERFACE 库，装了也能被 find_package 找到、能编译 —— 只是链接时
 #  会缺符号，这是刻意的：接口评审阶段就该暴露"还没有实现"。
 file(GLOB_RECURSE HTTPMECH_SOURCES CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
 
 if(HTTPMECH_SOURCES)
-    add_library(httpmech STATIC ${HTTPMECH_SOURCES})
+    add_library(httpmech ${HTTPMECH_LIBRARY_TYPE} ${HTTPMECH_SOURCES})
     set(HTTPMECH_IS_INTERFACE OFF)
 else()
     message(STATUS "httpmech: src/ 下暂无 .cpp，构建为 INTERFACE（header-only）库")
@@ -122,6 +133,21 @@ else()
 endif()
 
 add_library(httpmech::httpmech ALIAS httpmech)
+
+if(HTTPMECH_LIBRARY_TYPE STREQUAL "SHARED")
+    target_compile_definitions(httpmech PUBLIC HTTPMECH_SHARED)
+    target_compile_definitions(httpmech PRIVATE HTTPMECH_BUILDING_LIBRARY)
+    set_target_properties(httpmech PROPERTIES
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON)
+    if(MSVC)
+        target_compile_options(httpmech PRIVATE /wd4251)
+    elseif(UNIX AND NOT APPLE)
+        target_link_options(httpmech PRIVATE "-Wl,--exclude-libs,ALL")
+    elseif(APPLE)
+        target_link_options(httpmech PRIVATE "-Wl,-hidden-lsymbols")
+    endif()
+endif()
 set_target_properties(httpmech PROPERTIES
     POSITION_INDEPENDENT_CODE ${HTTPMECH_PIC}
     FOLDER "httpmech")

@@ -18,6 +18,8 @@
 // =============================================================================
 #pragma once
 
+#include "httpmech/export.hpp"
+
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -34,14 +36,14 @@ namespace httpmech {
 /// @note 「多个不同值」按 RFC 9110 §8.6 属于协议错误，解析器会在
 ///       更早的阶段就以 `Errc::bad_content_length` 拒掉；这里返回 nullopt
 ///       只是给手工构造的消息用。
-[[nodiscard]] std::optional<std::uint64_t> parse_content_length(const HeadersView& h) noexcept;
+[[nodiscard]] HTTPMECH_API std::optional<std::uint64_t> parse_content_length(const HeadersView& h) noexcept;
 
 // =============================================================================
 //  请求
 // =============================================================================
 
 /// 收到的一条请求（服务端）。
-struct HttpRequest {
+struct HTTPMECH_API HttpRequest {
     /// 方法。认识的方法是枚举，不认识的是 `Method::unknown`（原样看 `method_text`）。
     Method method = Method::unknown;
     std::string_view method_text;   ///< 原始方法 token
@@ -161,7 +163,7 @@ struct HttpRequest {
 // =============================================================================
 
 /// 收到的一条响应（客户端）。
-struct HttpResponse {
+struct HTTPMECH_API HttpResponse {
     Version version = Version::http_1_1;
 
     /// 状态码的枚举形态；不在枚举表里时是 `Status::other`。

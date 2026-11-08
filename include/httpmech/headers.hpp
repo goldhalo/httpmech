@@ -16,6 +16,8 @@
 // =============================================================================
 #pragma once
 
+#include "httpmech/export.hpp"
+
 #include <cstddef>
 #include <string>
 #include <string_view>
@@ -33,10 +35,10 @@ struct HeaderField {
 };
 
 /// ASCII 大小写不敏感比较。
-[[nodiscard]] bool iequals(std::string_view a, std::string_view b) noexcept;
+[[nodiscard]] HTTPMECH_API bool iequals(std::string_view a, std::string_view b) noexcept;
 
 /// 去掉首尾的 OWS（空格 / 制表符），用于解析出来的字段值。
-[[nodiscard]] std::string_view trim_ows(std::string_view s) noexcept;
+[[nodiscard]] HTTPMECH_API std::string_view trim_ows(std::string_view s) noexcept;
 
 // =============================================================================
 //  借用视图（解析结果用）
@@ -46,7 +48,7 @@ struct HeaderField {
 ///
 /// @warning 字段内容指向**解析器内部的接收缓冲**。它只在"当前这条消息还在处理"
 ///          期间有效 —— 即从回调进入，到回调返回为止。要跨回调保存请自己拷。
-class HeadersView {
+class HTTPMECH_API HeadersView {
 public:
     constexpr HeadersView() noexcept = default;
     constexpr explicit HeadersView(span<const HeaderField> fields) noexcept : m_fields(fields) {}
@@ -80,7 +82,7 @@ private:
 /// out.add_header("Set-Cookie", "a=1");
 /// out.add_header("Set-Cookie", "b=2");
 /// @endcode
-class Headers {
+class HTTPMECH_API Headers {
 public:
     Headers() = default;
     Headers(const Headers&) = default;

@@ -22,6 +22,8 @@
 // =============================================================================
 #pragma once
 
+#include "httpmech/export.hpp"
+
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -40,6 +42,7 @@
 
 namespace netmech {
 class Mechanism;   // 前向声明：仅 create_with_mechanism() 用到，不需要它的头
+class Runtime;     // 前向声明：ServerConfig::runtime
 } // namespace netmech
 
 namespace httpmech {
@@ -66,7 +69,7 @@ class ServerSession;   ///< 内部：一条连接，见 src/server.cpp
 /// `write()` 的字节先攒在内存里，攒够 `ServerConfig::max_buffered_response`
 /// 就自动切成 `Transfer-Encoding: chunked` 流式发出。**应用代码不变**：
 /// 一直 `write()` 然后 `end()` 即可。
-class ResponseWriter {
+class HTTPMECH_API ResponseWriter {
 public:
     ResponseWriter(const ResponseWriter&)            = delete;
     ResponseWriter& operator=(const ResponseWriter&) = delete;
@@ -178,7 +181,7 @@ struct ResponseSummary {
 /// - `BodyMode::aggregate`（默认）：只实现 `on_request`，body 已完整。
 /// - `BodyMode::stream`：实现 `on_headers` / `on_body_data` / `on_body_end`，
 ///   **不要**再在 `on_headers` 里写响应 —— 响应应在 `on_body_end` 里写。
-class RequestHandler {
+class HTTPMECH_API RequestHandler {
 public:
     virtual ~RequestHandler() = default;
 
@@ -248,6 +251,11 @@ struct ServerConfig {
     /// 响应、发 `Connection: close`）。防止长连接永久占用资源。
     std::size_t max_requests_per_connection = 1000;
 
+    /// 注入 netmech 的 io 运行时（`netmech/runtime.hpp`）。
+    /// 空 = 进程级默认运行时；非空 = 本 server 的 accept/连接都跑在该 Runtime 上。
+    /// @note 本头只前向声明；创建 Runtime 需包含 `<netmech/runtime.hpp>`。
+    std::shared_ptr<netmech::Runtime> runtime;
+
     /// 响应在内存里攒多少字节之后转 chunked 流式（默认 64 KiB）。
     std::size_t max_buffered_response = 64 * 1024;
 
@@ -299,7 +307,7 @@ struct ServerConfig {
 /// @par 生命周期
 /// 通过 `create()` 得到 shared_ptr。`stop()` 之后 server 仍存活，
 /// 但不再接受新连接，既有连接在回调返回后被关闭。
-class HttpServer : public std::enable_shared_from_this<HttpServer> {
+class HTTPMECH_API HttpServer : public std::enable_shared_from_this<HttpServer> {
 public:
     struct Impl;   ///< 内部实现（不透明，定义在 src/server.cpp）
 

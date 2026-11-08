@@ -1,6 +1,6 @@
 # httpmech 概要设计（v0.1 草案）
 
-> 状态：**接口草案，未实现**。本文件与 `include/httpmech/*.hpp` 一起评审；
+> 状态：**已实现**（对应 v0.9）。本文件与 `include/httpmech/*.hpp` 一起评审；
 > 评审通过后写 `src/`。
 
 ---

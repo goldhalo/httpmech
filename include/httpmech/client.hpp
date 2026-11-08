@@ -26,6 +26,8 @@
 // =============================================================================
 #pragma once
 
+#include "httpmech/export.hpp"
+
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -43,6 +45,7 @@
 
 namespace netmech {
 class Mechanism;   // 前向声明（仅 create_with_mechanism 用）
+class Runtime;     // 前向声明（ClientConfig / WebSocketClientConfig::runtime）
 } // namespace netmech
 
 namespace httpmech {
@@ -76,7 +79,7 @@ struct RequestSpec {
 //  响应回调
 // =============================================================================
 
-class ResponseHandler {
+class HTTPMECH_API ResponseHandler {
 public:
     virtual ~ResponseHandler() = default;
 
@@ -105,6 +108,8 @@ public:
 // =============================================================================
 
 struct ClientConfig {
+    /// 注入 netmech 的 io 运行时（`netmech/runtime.hpp`）。空 = 默认运行时。
+    std::shared_ptr<netmech::Runtime> runtime;
     /// 目标地址（含端口）。`Host:` 头按它填（`IP:port`，端口 80 时省略）。
     Endpoint remote{"127.0.0.1", 80};
 
@@ -148,7 +153,7 @@ struct ClientConfig {
 /// @par 线程模型
 /// `request()` 可在任意线程调用；回调在 io 线程上串行执行。
 /// 同一时刻**只有一个请求在途**，其余按提交顺序排队。
-class HttpClient : public std::enable_shared_from_this<HttpClient> {
+class HTTPMECH_API HttpClient : public std::enable_shared_from_this<HttpClient> {
 public:
     struct Impl;   ///< 内部实现（不透明，定义在 src/client.cpp）
 
@@ -194,6 +199,8 @@ private:
 // =============================================================================
 
 struct WebSocketClientConfig {
+    /// 注入 netmech 的 io 运行时（`netmech/runtime.hpp`）。空 = 默认运行时。
+    std::shared_ptr<netmech::Runtime> runtime;
     /// 服务端地址（含端口）。
     Endpoint remote{"127.0.0.1", 80};
 
@@ -253,7 +260,7 @@ struct WebSocketClientHandlers {
 /// @par 重连
 /// **不自动重连**。掉线后 `on_close` / `on_error` 会来一次，要不要重连、隔多久
 /// 重连由应用决定（设备侧通常要退避）。库只提供一次干净的状态复位。
-class WebSocketClient : public std::enable_shared_from_this<WebSocketClient> {
+class HTTPMECH_API WebSocketClient : public std::enable_shared_from_this<WebSocketClient> {
 public:
     struct Impl;   ///< 内部实现（不透明，定义在 src/client.cpp）
 

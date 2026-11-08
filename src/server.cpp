@@ -1006,7 +1006,8 @@ std::shared_ptr<HttpServer> HttpServer::create(ServerConfig                    c
     // 自己建 io 运行时：调用方不需要认识 netmech。
     // netmech 的线程池是**进程级懒建**的，所以这里 create() 不会白起线程；
     // 真正用到网络时才建（线程数由 netmech::initialize() 决定，默认 hw 核数）。
-    return create_with_mechanism(netmech::Mechanism::create(), std::move(cfg),
+    auto mech = netmech::Mechanism::create(netmech::Mechanism::Config{}, cfg.runtime);
+    return create_with_mechanism(std::move(mech), std::move(cfg),
                                  std::move(handler));
 }
 

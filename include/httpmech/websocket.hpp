@@ -20,6 +20,8 @@
 // =============================================================================
 #pragma once
 
+#include "httpmech/export.hpp"
+
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -110,7 +112,7 @@ struct WebSocketConfig {
 ///
 /// @note 返回 false 表示"这一帧**没被受理**"（连接已关 / 底层反压），
 ///       不是错误、也不代表连接断了；要不要重试由调用方决定。
-class WebSocketSession {
+class HTTPMECH_API WebSocketSession {
 public:
     virtual ~WebSocketSession() = default;
 
@@ -184,6 +186,6 @@ struct WebSocketHandlers {
 ///
 /// @note 只是把 RFC 6455 §4.2.2 的那一步（SHA-1 + Base64）暴露出来，
 ///       便于单元测试与诊断；正常流程由库内部调用，应用不用管。
-[[nodiscard]] std::string make_websocket_accept(std::string_view client_key);
+[[nodiscard]] HTTPMECH_API std::string make_websocket_accept(std::string_view client_key);
 
 } // namespace httpmech

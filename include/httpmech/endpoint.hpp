@@ -13,6 +13,8 @@
 // =============================================================================
 #pragma once
 
+#include "httpmech/export.hpp"
+
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -28,7 +30,7 @@ namespace httpmech {
 /// httpmech::Endpoint ep{"127.0.0.1", 8080};
 /// if (auto p = httpmech::Endpoint::parse("192.168.3.10:9898")) { ... }
 /// @endcode
-class Endpoint {
+class HTTPMECH_API Endpoint {
 public:
     Endpoint() noexcept = default;
 
