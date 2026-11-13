@@ -201,6 +201,10 @@ if(HTTPMECH_BUILD_EXAMPLES)
         get_filename_component(name ${src} NAME_WE)
         add_executable(${name} ${src})
         target_link_libraries(${name} PRIVATE httpmech httpmech_compile_options)
+        # static_json_server.cpp 用 vendored 的 nlohmann/json.hpp；
+        # include 到 thirdparty/ 一层，代码里写 <nlohmann/json.hpp>。
+        target_include_directories(${name} PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty")
     endforeach()
 endif()
 

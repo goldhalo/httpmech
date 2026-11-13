@@ -243,6 +243,46 @@ curl -i -H 'Range: bytes=0-9' http://127.0.0.1:8080/index.html
 curl -i -H 'If-None-Match: <ETag>' http://127.0.0.1:8080/index.html
 ```
 
+### JSON 配置驱动的静态服务器
+
+`static_json_server` 只接受一个参数：JSON 配置文件路径。监听端口和全部静态
+服务配置都从 JSON 读（vendored `thirdparty/nlohmann`，MIT 3.11.3，无额外依赖）。
+
+```bash
+cmake --build build --target static_json_server
+./build/bin/static_json_server example/static_server.json
+```
+
+完整字段见 `example/static_server.json`，结构如下：
+
+```json
+{
+  "server": { "host": "0.0.0.0", "port": 8080, "max_send_queue_bytes": 2097152 },
+  "static": {
+    "root": "./www",
+    "mount_point": "/",
+    "index_file": "index.html",
+    "enable_range": true,
+    "enable_etag": true,
+    "mime_types": { "md": "text/markdown; charset=utf-8" },
+    "headers": { "Cache-Control": "public, max-age=60" }
+  }
+}
+```
+
+| JSON 字段 | 对应 API | 默认 |
+|---|---|---|
+| `server.host` / `port` | `ServerConfig::local` | `0.0.0.0:8080`（port 0 = 系统分配，启动后打印实际端口） |
+| `server.server_name` / `emit_date` | 同名 | `httpmech-static` / `true` |
+| `server.max_send_queue_bytes` | 同名 | 2 MiB |
+| `static.root` / `mount_point` / `index_file` | `StaticFileConfig` 同名 | `./www` / `/` / `index.html` |
+| `static.default_content_type` / `max_file_bytes` | 同名 | `application/octet-stream` / 0（不限制） |
+| `static.enable_range` / `enable_etag` / `redirect_directory` | 同名 | `true` |
+| `static.mime_types` / `headers` | 同名映射，逐条覆盖 | 空 |
+
+字段缺失用默认值；类型写错或文件打不开会打印 `config error: ...` 并以非零码退出。
+`mime_types` 的 key 大小写不敏感、可带前导 `.`。
+
 ### 客户端
 
 ```cpp
@@ -460,9 +500,9 @@ httpmech/
 │   └── client.hpp         HttpClient / WebSocketClient
 ├── src/                   实现（parser / server / router / static_file / websocket / sha1+base64）
 ├── test/                  单元测试 + 端到端测试
-├── example/               hello_server.cpp / static_server.cpp
+├── example/               hello_server / static_server / static_json_server + JSON 配置示例
 ├── docs/design.md         概要设计
-└── thirdparty/            picohttpparser（MIT，vendored）
+└── thirdparty/            picohttpparser、nlohmann/json（均 MIT，vendored）
 ```
 
 ## 依赖与许可
@@ -478,6 +518,9 @@ httpmech/
     `Mechanism`。不传的话每个库自己建一个（线程池仍是进程级共享的，只是 `Mechanism`
     各管各的监听器）。
 - 解析：[picohttpparser](https://github.com/h2o/picohttpparser)（MIT，已 vendored）
+- 示例的 JSON 配置：[nlohmann/json](https://github.com/nlohmann/json) 3.11.3
+  （MIT，已 vendored 到 `thirdparty/nlohmann/`；只被 `example/static_json_server.cpp`
+  使用，**不随库安装**、不影响 `libhttpmech` 的依赖面）
 - 本库：MIT，见 [LICENSE](LICENSE)
 
 ## 动态库与 Runtime 注入

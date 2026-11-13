@@ -1,0 +1,27 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8080,
+    "server_name": "httpmech-static",
+    "emit_date": true,
+    "max_send_queue_bytes": 2097152
+  },
+  "static": {
+    "root": "./www",
+    "mount_point": "/",
+    "index_file": "index.html",
+    "default_content_type": "application/octet-stream",
+    "max_file_bytes": 0,
+    "enable_range": true,
+    "enable_etag": true,
+    "redirect_directory": true,
+    "mime_types": {
+      "md": "text/markdown; charset=utf-8",
+      "log": "text/plain; charset=utf-8",
+      "woff2": "font/woff2"
+    },
+    "headers": {
+      "Cache-Control": "public, max-age=60"
+    }
+  }
+}
