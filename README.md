@@ -3,7 +3,9 @@
 [![CI](https://github.com/goldhalo/httpmech/actions/workflows/ci.yml/badge.svg)](https://github.com/goldhalo/httpmech/actions/workflows/ci.yml)
 
 **HTTP/1.1 与 WebSocket 的服务端协议层**，基于 [netmech](../netmech) 的 TCP。
-TLS、HTTP/2、静态文件都交给前面的 nginx，本库只处理它转过来的明文请求。
+TLS、HTTP/2 交给前面的 nginx，本库只处理它转过来的明文请求。
+静态文件由可选的 `StaticFileHandler` 组件提供（分块投递、背压、任意大小文件，
+见「静态文件服务」一节）；超高并发静态服务仍建议交给 nginx。
 
 ```
 浏览器 ──HTTPS/WSS──► nginx ──HTTP/1.1 明文──► httpmech ──► netmech ──► TCP
@@ -26,7 +28,8 @@ TLS、HTTP/2、静态文件都交给前面的 nginx，本库只处理它转过�
 | 路由（精确匹配）+ before/after 钩子 | HTTP/2、gRPC |
 | WebSocket（握手、帧层、分片、ping/pong、close） | 业务纤程 / 线程池 |
 | keep-alive、流式 body、资源上限 | 连接池 / 自动重连 / 重定向跟随 |
-| `X-Real-IP` / `X-AGENT-SSL` 代理头识别（白名单） | 静态文件、gzip、multipart |
+| `X-Real-IP` / `X-AGENT-SSL` 代理头识别（白名单） | gzip、multipart |
+| 静态文件 + 通用大响应通道（分块投递、背压、单段/多段 Range） | 目录列表、gzip、sendfile |
 | **客户端**：HttpClient（串行队列）/ WebSocketClient | 连接池、自动重连、cookie 罐 |
 
 设计取舍见 **[docs/design.md](docs/design.md)**（含与 wtoe::HttpProtocol 的对照）。
@@ -178,6 +181,66 @@ public:
         out.end_status(httpmech::Status::ok, "stored");
     }
 };
+```
+
+### 静态文件服务（可选组件）
+
+`StaticFileHandler` 是独立的 `RequestHandler`，既能接管全部请求，也能挂成路由表的
+404 兜底。文件通过 `ResponseWriter::set_body_provider()` 分块投递：由写完成回调
+驱动下一块，每连接最多 1 块（256 KiB）在途，**内存占用与文件大小无关**，
+慢客户端靠 `ServerConfig::max_send_queue_bytes` 背压。
+
+```cpp
+httpmech::StaticFileConfig sf;
+sf.root             = "./www";
+sf.mount_point      = "/static";        // 段边界匹配，不会吞掉 /statics/x
+sf.mime_types["md"] = "text/markdown; charset=utf-8";
+sf.extra_headers.set("Cache-Control", "public, max-age=60");
+// sf.max_file_bytes 默认 0 = 不限制；设成非 0 只是业务策略（超过回 403）
+
+httpmech::ServerConfig cfg;
+cfg.max_send_queue_bytes = 2 * 1024 * 1024;   // 可选：单连接发送队列水位
+// 不需要调 max_buffered_response：它只管老的 write() 自动切 chunked 路径
+
+auto router = std::make_shared<httpmech::Router>();
+router->before(auth_hook);                    // 鉴权先于静态文件
+auto files = httpmech::mount_static(router, std::move(sf));
+if (!files->valid()) { /* files->error_message() */ }
+
+auto srv = httpmech::HttpServer::create(cfg, router);
+```
+
+`mount_static()` 挂的是 `set_not_found()`，所以 `before` 钩子（鉴权）依然生效，
+不会像 cpp-httplib 的 mount point 那样跳过路由前的处理。
+
+支持：GET/HEAD、任意大小文件、`index.html`、目录 301、扩展名→MIME、
+`ETag`/`Last-Modified`、`If-None-Match`/`If-Modified-Since`/304、
+`If-Range`、单段与多段 `Range`（`multipart/byteranges`）/206/416（含大偏移、
+段数上限 DoS 防护）、`Accept-Ranges`、405 `Allow`、慢客户端背压、keep-alive 复用。
+
+不做：gzip / 静态压缩（零外部依赖约定，nginx 可代劳）、目录列表、真·sendfile /
+mmap 零拷贝。分块投递已把内存占用降到与文件大小无关，再引入平台相关的映射
+代码收益有限。provider 目前在该连接的 io 线程上同步 `read()` 一块；根目录若在
+慢速网络盘上，接入方应自行把文件 IO 挪到业务线程池再经 `Conn::post()` 回投。
+
+**通用大响应能力**：`set_body_provider()` 不只服务静态文件，大 JSON、日志流也能用
+（`include/httpmech/response_body.hpp`）。`after` 钩子由库在响应真正结束时触发，
+异步响应下 `ResponseSummary` 的 `body_bytes` / `elapsed` 仍是准确值。
+
+路径安全按 cpp-httplib 的口径：先 percent-decode，再拒绝 `..`/空段/
+尾点尾空格/NUL/反斜杠（Windows 还拒 `:`，防 NTFS 流 `a.txt::$DATA`），
+最后 `weakly_canonical()` 与规范化根目录做前缀比较，挡住 symlink/junction 逃逸。
+
+跑示例：
+
+```bash
+cmake --build build --target static_server
+./build/bin/static_server 8080 ./www
+
+curl -i  http://127.0.0.1:8080/
+curl -I  http://127.0.0.1:8080/index.html
+curl -i -H 'Range: bytes=0-9' http://127.0.0.1:8080/index.html
+curl -i -H 'If-None-Match: <ETag>' http://127.0.0.1:8080/index.html
 ```
 
 ### 客户端
@@ -391,11 +454,13 @@ httpmech/
 │   ├── parser.hpp         增量 HTTP 解析器
 │   ├── websocket.hpp      WebSocket 服务端（会话 / 配置 / 握手）
 │   ├── server.hpp         HttpServer / ResponseWriter / RequestHandler
+│   ├── response_body.hpp  DataSink / ContentProvider（异步大响应）
 │   ├── router.hpp         Router：精确路由 + before/after
+│   ├── static_file.hpp    StaticFileHandler（可选静态文件组件）
 │   └── client.hpp         HttpClient / WebSocketClient
-├── src/                   实现（parser / server / router / websocket / sha1+base64）
+├── src/                   实现（parser / server / router / static_file / websocket / sha1+base64）
 ├── test/                  单元测试 + 端到端测试
-├── example/hello_server.cpp
+├── example/               hello_server.cpp / static_server.cpp
 ├── docs/design.md         概要设计
 └── thirdparty/            picohttpparser（MIT，vendored）
 ```

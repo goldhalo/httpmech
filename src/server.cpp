@@ -29,9 +29,11 @@
 #include <netmech/iohandler.hpp>
 #include <netmech/linkable.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -90,6 +92,18 @@ struct ResponseWriter::Impl {
     bool                   chunked  = false;   ///< 已切 chunked 流式
     bool                   stream_ended = false;
 
+    // --- 异步响应体（阶段 2）---
+    BodyProviderSpec provider_spec;
+    bool          provider_active      = false;  ///< 头已发、正在逐块投递
+    bool          provider_done_called = false;  ///< chunked 模式 provider 调了 done()
+    bool          provider_finished    = false;
+    bool          provider_chunked     = false;  ///< length == 0
+    std::uint64_t provider_length      = 0;
+    std::uint64_t provider_written     = 0;
+    std::size_t   body_bytes_total     = 0;      ///< 累计投递字节数（供 after）
+    std::function<void(const ResponseSummary&)> completion_hook;
+    bool          completion_fired     = false;
+
     void reset_for_request(bool head_request)
     {
         status   = Status::ok;
@@ -104,6 +118,17 @@ struct ResponseWriter::Impl {
         no_body  = head_request;
         chunked  = false;
         stream_ended = false;
+
+        provider_spec         = BodyProviderSpec{};
+        provider_active       = false;
+        provider_done_called  = false;
+        provider_finished     = false;
+        provider_chunked      = false;
+        provider_length       = 0;
+        provider_written      = 0;
+        body_bytes_total      = 0;
+        completion_hook       = nullptr;
+        completion_fired      = false;
     }
 };
 
@@ -178,6 +203,11 @@ public:
     {
         m_conn = std::move(c);
         m_owner->conns.fetch_add(1, std::memory_order_relaxed);
+        // 限制单连接的发送队列字节数：异步响应体靠它做背压，
+        // 慢客户端不会把整文件堆进内存（0 = 不限制，netmech 语义）。
+        if (m_conn) {
+            m_conn->set_send_queue_limit(m_owner->cfg.max_send_queue_bytes, 0);
+        }
         return start_read();
     }
 
@@ -222,6 +252,12 @@ public:
         if (m_closed.load(std::memory_order_relaxed)) {
             return;
         }
+        if (m_provider_active_flag.load(std::memory_order_acquire)) {
+            // 异步响应体还没发完：暂停读，否则 pipelining 的下一条请求会
+            // 在 provider 状态机还没收尾时进来。由 finish_provider() 恢复。
+            m_read_suspended = true;
+            return;
+        }
         if (m_close_after_all.load(std::memory_order_acquire)) {
             // 有"写完就关"的报文在途：**不能在这里关**，
             // 否则那帧还没写出去就被掐断（WS 的 close 帧就栽在这上面）。
@@ -241,6 +277,11 @@ public:
             close_now();
             return;
         }
+        // 异步响应体：一块落地后，post 回 io 线程取下一块。
+        // 用 post 而不是直接调用，避免在 netmech 的完成回调里递归驱动。
+        if (left == 0 && m_provider_active_flag.load(std::memory_order_acquire)) {
+            schedule_provider_pump();
+        }
         // "写完就关"：必须等**所有**已受理的写都落地。
         // 早先这是个 bool 标志 + 队列，谁先完成谁就关 —— close 帧排在别人后面时会被吞掉。
         if (left == 0 && m_close_after_all.load(std::memory_order_acquire)) {
@@ -250,6 +291,13 @@ public:
 
     void on_close() override
     {
+        if (m_writer.provider_active) {
+            // 连接被提前关掉：仍要让 after 钩子收到一次「未完成」的摘要，
+            // 否则访问日志会永远缺这一条。
+            fire_completion(false);
+            m_writer.provider_active = false;
+            m_provider_active_flag.store(false, std::memory_order_release);
+        }
         if (m_ws) {
             m_ws->on_transport_closed();
         }
@@ -273,6 +321,10 @@ public:
     {
         if (m_closed.load(std::memory_order_relaxed) ||
             m_busy.load(std::memory_order_acquire)) {
+            return;
+        }
+        // 异步响应体正在发送时，连接既不空闲也不该被 idle 超时掐断。
+        if (m_provider_active_flag.load(std::memory_order_acquire)) {
             return;
         }
         if (m_is_ws.load(std::memory_order_acquire)) {
@@ -370,8 +422,10 @@ public:
 
 private:
     friend class httpmech::ResponseWriter;   // 流式响应直接调 start/send_stream_chunk
+    friend class httpmech::DataSink;         // DataSink::write/writable/done 转到这里
 
-    static constexpr std::size_t kReadChunk = 16 * 1024;
+    static constexpr std::size_t kReadChunk      = 16 * 1024;
+    static constexpr std::size_t kProviderChunk  = 256 * 1024;   ///< 与 cpp-httplib 同量级
 
     static httpmech::Parser::Config make_parser_cfg(const ServerConfig& cfg)
     {
@@ -394,6 +448,15 @@ private:
     bool send_stream_chunk(span<const std::uint8_t> data);
     /// 发 0 长度块收尾（end() 调用）。
     void finish_stream_response();
+
+    // --- 异步响应体（阶段 2）---
+    bool provider_write(span<const std::uint8_t> data);
+    bool provider_writable() const noexcept;
+    void provider_done() noexcept;
+    void pump_provider();
+    void schedule_provider_pump();
+    void finish_provider(bool ok);
+    void fire_completion(bool ok);
 
     std::shared_ptr<HttpServer::Impl> m_owner;
     std::shared_ptr<netmech::Conn>    m_conn;
@@ -422,6 +485,12 @@ private:
 
     std::atomic<bool> m_closed{false};
     bool              m_stream_headers_done = false;
+
+    /// sweeper 线程只读原子量，不直接碰 m_writer（避免数据竞争）。
+    std::atomic<bool> m_provider_active_flag{false};
+    std::atomic<bool> m_provider_pump_scheduled{false};
+    /// io 线程专用：on_read 因异步发送暂停过，由 finish_provider 恢复。
+    bool              m_read_suspended = false;
 
     /// 应用回调正在执行（io 线程置位、sweeper 读 —— 必须原子）。
     /// 非原子时 sweeper 会读到陈旧的 false，把**正在长处理**的连接判成空闲
@@ -651,7 +720,10 @@ void ServerSession::pump()
                 return;
             }
             if (m_closed.load(std::memory_order_relaxed) ||
-                m_close_after_all.load(std::memory_order_acquire)) {
+                m_close_after_all.load(std::memory_order_acquire) ||
+                m_provider_active_flag.load(std::memory_order_acquire)) {
+                // 异步响应体还没发完：此时解析器尚未 reset，继续 next() 会
+                // 把同一条消息反复派发。等 finish_provider() 复位后再读。
                 return;
             }
             break;
@@ -669,7 +741,8 @@ void ServerSession::pump()
         case httpmech::Parser::Result::message_end:
             dispatch_stream_events({}, true);
             if (m_closed.load(std::memory_order_relaxed) ||
-                m_close_after_all.load(std::memory_order_acquire)) {
+                m_close_after_all.load(std::memory_order_acquire) ||
+                m_provider_active_flag.load(std::memory_order_acquire)) {
                 return;
             }
             break;
@@ -735,7 +808,9 @@ void ServerSession::dispatch_stream_events(span<const std::uint8_t> body, bool i
         m_owner->handler->on_body_end(req, out);
     }
     finish_writer(req.keep_alive);
-    m_stream_headers_done = false;
+    if (!m_provider_active_flag.load(std::memory_order_acquire)) {
+        m_stream_headers_done = false;
+    }
 }
 
 void ServerSession::respond_protocol_error(Status code)
@@ -903,10 +978,14 @@ void ServerSession::finish_writer(bool keep_alive)
         const ServerConfig& cfg = m_owner->cfg;
         const bool too_many = (cfg.max_requests_per_connection != 0 &&
                                m_served >= cfg.max_requests_per_connection);
+        fire_completion(true);
         reset_for_next_request(keep_alive && !too_many);
         return;
     }
     if (m_writer.sent || m_writer.aborted) {
+        // upgrade_websocket() 自己把 101 发出去了，这里走不到发送逻辑，
+        // 但 after 钩子仍要收到一次摘要（否则 WS 请求永远没有访问日志）。
+        if (m_writer.upgraded) { fire_completion(true); }
         return;
     }
 
@@ -959,9 +1038,14 @@ void ServerSession::finish_writer(bool keep_alive)
 
     const bool no_content = (m_writer.code == 204 || m_writer.code == 304 ||
                              (m_writer.code >= 100 && m_writer.code < 200));
-    if (!no_content && !m_writer.headers.has("Content-Length")) {
+    const bool has_provider = static_cast<bool>(m_writer.provider_spec.provider);
+    if (has_provider && m_writer.provider_spec.length == 0) {
+        // 未知长度：chunked，由 provider 调 done() 结束。
+        wire.append("Transfer-Encoding: chunked\r\n");
+    } else if (!no_content && !m_writer.headers.has("Content-Length")) {
         wire.append("Content-Length: ");
-        wire.append(std::to_string(m_writer.body.size()));
+        wire.append(std::to_string(has_provider ? m_writer.provider_spec.length
+                                                : m_writer.body.size()));
         wire.append("\r\n");
     }
 
@@ -987,16 +1071,231 @@ void ServerSession::finish_writer(bool keep_alive)
     }
     wire.append("\r\n");
 
-    if (!no_content && !m_writer.no_body) {
+    if (!no_content && !m_writer.no_body && !has_provider) {
         wire.append(m_writer.body);
+    }
+
+    // HEAD：Content-Length 已经按 provider 的总长度写好，这里只发头，
+    // 不启动状态机（否则会把整个文件读出来又丢弃）。
+    if (has_provider && !m_writer.no_body) {
+        m_writer.provider_active   = true;
+        m_writer.provider_length  = m_writer.provider_spec.length;
+        m_writer.provider_chunked = (m_writer.provider_spec.length == 0);
+        m_writer.provider_written = 0;
+        m_provider_active_flag.store(true, std::memory_order_release);
+
+        // provider 期间所有写都不带 close_after：关闭由 finish_provider 统一决定，
+        // 否则 on_write 的 close_after_all 分支会在最后一块落地时先掐断连接。
+        if (!send(std::move(wire), false)) {
+            fire_completion(false);
+            m_writer.provider_active = false;
+            m_provider_active_flag.store(false, std::memory_order_release);
+            close_now();
+            return;
+        }
+        pump_provider();   // 头还在途时由 on_write 驱动；否则立即投第一块
+        return;            // 不 reset，等异步完成
     }
 
     if (!send(std::move(wire), !ka)) {
         close_now();   // 响应发不出去（对端已断 / 反压）：关掉，别让客户端干等
+    } else {
+        fire_completion(true);
     }
 
     // 为下一条请求做准备（keep-alive）。升级成 WebSocket 之后不适用。
     reset_for_next_request(ka);
+}
+
+// =============================================================================
+//  异步响应体状态机（阶段 2）
+//
+//  驱动方式：finish_writer() 发完响应头 → pump_provider() 取第一块 →
+//  Conn::write 完成回调 on_write() → Conn::post() 回 io 线程 → pump_provider()。
+//  每一轮最多只有 1 块在途，内存占用与文件大小无关，这就是背压。
+// =============================================================================
+
+bool ServerSession::provider_writable() const noexcept
+{
+    const auto limit = m_owner->cfg.max_send_queue_bytes;
+    return limit == 0 ||
+           m_inflight_bytes.load(std::memory_order_relaxed) < limit;
+}
+
+void ServerSession::provider_done() noexcept
+{
+    if (m_writer.provider_active) {
+        m_writer.provider_done_called = true;
+    }
+}
+
+bool ServerSession::provider_write(span<const std::uint8_t> data)
+{
+    if (!m_writer.provider_active || m_writer.provider_finished ||
+        m_closed.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    if (data.empty()) { return true; }
+
+    // 超出声明的 Content-Length 会把多出来的字节变成客户端眼里的下一条响应。
+    if (!m_writer.provider_chunked) {
+        const auto remaining = m_writer.provider_length - m_writer.provider_written;
+        if (data.size() > remaining) { return false; }
+    }
+
+    std::string wire;
+    if (m_writer.provider_chunked) {
+        char hex[32]{};
+        std::snprintf(hex, sizeof(hex), "%zx\r\n", data.size());
+        wire.append(hex);
+        wire.append(reinterpret_cast<const char*>(data.data()), data.size());
+        wire.append("\r\n");
+    } else {
+        wire.assign(reinterpret_cast<const char*>(data.data()), data.size());
+    }
+
+    // 已设置发送队列水位、且每连接只保持一块在途，所以返回 false 基本只可能是
+    // 连接已关；不重试，交给状态机收尾，避免把块悄悄丢掉。
+    if (!send(std::move(wire), false)) { return false; }
+
+    m_writer.provider_written += data.size();
+    m_writer.body_bytes_total += data.size();
+    return true;
+}
+
+void ServerSession::schedule_provider_pump()
+{
+    if (m_provider_pump_scheduled.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    std::shared_ptr<ServerSession> self = shared_from_this();
+    auto c = conn_snapshot();
+    if (!c) {
+        m_provider_pump_scheduled.store(false, std::memory_order_release);
+        return;
+    }
+    c->post([self]() mutable {
+        self->m_provider_pump_scheduled.store(false, std::memory_order_release);
+        self->pump_provider();
+    }, false);
+}
+
+void ServerSession::pump_provider()
+{
+    if (!m_writer.provider_active || m_writer.provider_finished) { return; }
+    if (m_closed.load(std::memory_order_relaxed)) { finish_provider(false); return; }
+
+    // 背压：前一块还没落地，或队列水位没降下来，就停在这里等 on_write。
+    if (m_inflight.load(std::memory_order_acquire) != 0) { return; }
+    if (!provider_writable()) { return; }
+
+    if (!m_writer.provider_chunked &&
+        m_writer.provider_written >= m_writer.provider_length) {
+        finish_provider(true);
+        return;
+    }
+    if (m_writer.provider_chunked && m_writer.provider_done_called) {
+        // 终止块必须发出去，否则 keep-alive 复用时下一条响应会接在
+        // 未终止的 chunked 流后面（a00718d 的 m1 修复）。
+        if (!send(std::string{"0\r\n\r\n"}, false)) {
+            finish_provider(false);
+            return;
+        }
+        finish_provider(true);
+        return;
+    }
+
+    const std::uint64_t remaining = m_writer.provider_chunked
+        ? static_cast<std::uint64_t>(kProviderChunk)
+        : (m_writer.provider_length - m_writer.provider_written);
+    const auto want = static_cast<std::size_t>(
+        (std::min)(remaining, static_cast<std::uint64_t>(kProviderChunk)));
+
+    const std::uint64_t before = m_writer.provider_written;
+    DataSink sink{this};
+    bool ok = false;
+    try {
+        ok = m_writer.provider_spec.provider(m_writer.provider_written, want, sink);
+    } catch (...) {
+        // provider 是应用回调：异常不能穿过 netmech 的 io 完成回调。
+        ok = false;
+    }
+    if (!ok) {
+        finish_provider(false);
+        close_now();
+        return;
+    }
+    if (m_writer.provider_written == before && !m_writer.provider_done_called) {
+        // 既没投递也没 done：下一轮还会拿到同样的 offset，会无限循环。
+        finish_provider(false);
+        close_now();
+        return;
+    }
+    if (m_inflight.load(std::memory_order_acquire) == 0 &&
+        !m_writer.provider_finished) {
+        // 该块已同步落地：post 而不是递归，避免大文件把栈打满。
+        schedule_provider_pump();
+    }
+}
+
+void ServerSession::fire_completion(bool ok)
+{
+    if (m_writer.completion_fired) { return; }
+    m_writer.completion_fired = true;
+    auto hook = m_writer.completion_hook;   // 拷一份：回调里可能改动 writer
+    if (!hook) { return; }
+
+    ResponseSummary sum;
+    sum.status     = m_writer.code;
+    sum.body_bytes = m_writer.body_bytes_total;
+    sum.upgraded   = m_writer.upgraded;
+    sum.keep_alive = ok && m_writer.request && m_writer.request->keep_alive;
+    const auto start = m_request_start_ns.load(std::memory_order_relaxed);
+    if (start != 0) {
+        const auto ns = now_ns_v() - start;
+        sum.elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::nanoseconds{ns < 0 ? 0 : ns});
+    }
+    try { hook(sum); } catch (...) {}
+}
+
+void ServerSession::finish_provider(bool ok)
+{
+    if (m_writer.provider_finished) { return; }
+    m_writer.provider_finished = true;
+    m_writer.provider_active   = false;
+    m_provider_active_flag.store(false, std::memory_order_release);
+
+    if (m_writer.provider_spec.on_complete) {
+        auto cb = m_writer.provider_spec.on_complete;
+        try { cb(ok); } catch (...) {}
+    }
+    fire_completion(ok);
+
+    if (!ok) { close_now(); return; }
+
+    const ServerConfig& cfg = m_owner->cfg;
+    const bool too_many = (cfg.max_requests_per_connection != 0 &&
+                           m_served >= cfg.max_requests_per_connection);
+    const bool keep = m_writer.request && m_writer.request->keep_alive &&
+                      !too_many &&
+                      !m_close_after_all.load(std::memory_order_acquire);
+    if (!keep) {
+        // 可能还有在途写（例如 chunked 的终止块）：交给 on_write 归零后再关，
+        // 直接 close_now() 会掐断最后一包（netmech 的 close 不冲刷在途写）。
+        if (m_inflight.load(std::memory_order_acquire) != 0) {
+            m_close_after_all.store(true, std::memory_order_release);
+        } else {
+            close_now();
+        }
+        return;
+    }
+
+    reset_for_next_request(true);
+    if (m_read_suspended) {
+        m_read_suspended = false;
+        if (!start_read()) { close_now(); }
+    }
 }
 
 bool ServerSession::switch_to_websocket(WebSocketHandlers handlers, WebSocketConfig wcfg,
@@ -1357,6 +1656,9 @@ bool ResponseWriter::write(span<const std::uint8_t> data)
     if (m_impl->aborted || m_impl->stream_ended) {
         return false;
     }
+    if (m_impl->provider_spec.provider) {
+        return false;   // 已注册异步响应体，两种通道不要混用
+    }
     if (!m_impl->sent) {
         // 还没发头：攒到 ServerConfig::max_buffered_response 就切 chunked 流式
         //（头文件承诺的行为；以前这里没有实现，大响应会整体驻留内存）。
@@ -1371,12 +1673,15 @@ bool ResponseWriter::write(span<const std::uint8_t> data)
             }
         } else {
             m_impl->body.append(reinterpret_cast<const char*>(data.data()), data.size());
+            m_impl->body_bytes_total += data.size();
             return true;
         }
     }
     // 已切 chunked：直接作为一个块发出
     if (m_impl->chunked) {
-        return m_impl->session->send_stream_chunk(data);
+        if (!m_impl->session->send_stream_chunk(data)) { return false; }
+        m_impl->body_bytes_total += data.size();
+        return true;
     }
     return false;
 }
@@ -1427,7 +1732,46 @@ std::uint16_t ResponseWriter::status_code() const noexcept
 
 std::size_t ResponseWriter::body_bytes() const noexcept
 {
-    return m_impl->body.size();
+    // 累计值：切 chunked 之后 body 已被 move 走，返回 body.size() 会变成 0。
+    return m_impl->body_bytes_total;
+}
+
+void ResponseWriter::set_body_provider(BodyProviderSpec spec)
+{
+    if (m_impl->sent || m_impl->aborted || !spec.provider) {
+        return;   // 头已发出（或无效）就退回普通响应
+    }
+    m_impl->provider_spec = std::move(spec);
+}
+
+void ResponseWriter::set_completion_hook_(
+    std::function<void(const ResponseSummary&)> cb)
+{
+    if (m_impl->sent || m_impl->aborted) { return; }
+    m_impl->completion_hook = std::move(cb);
+}
+
+// --- DataSink：只做转发，不暴露 ServerSession / netmech::Conn ---
+
+bool DataSink::write(span<const std::uint8_t> data)
+{
+    return m_session && m_session->provider_write(data);
+}
+
+bool DataSink::write(std::string_view text)
+{
+    return write(span<const std::uint8_t>{
+        reinterpret_cast<const std::uint8_t*>(text.data()), text.size()});
+}
+
+bool DataSink::writable() const noexcept
+{
+    return m_session && m_session->provider_writable();
+}
+
+void DataSink::done() noexcept
+{
+    if (m_session) { m_session->provider_done(); }
 }
 
 void ResponseWriter::abort() noexcept

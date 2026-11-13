@@ -73,7 +73,6 @@ std::size_t Router::websocket_route_count() const noexcept
 void Router::on_request(HttpRequest& req, ResponseWriter& out)
 {
     Impl& d = *m_impl;
-    const auto t0 = std::chrono::steady_clock::now();
 
     bool short_circuited = false;
 
@@ -134,19 +133,42 @@ void Router::on_request(HttpRequest& req, ResponseWriter& out)
         }
     }
 
-    // ---- 后置钩子：记日志。此时响应已写完，能拿到的只有标量 ----
+    // ---- 后置钩子：注册到「响应完成」事件 ----
+    // 同步响应由 finish_writer() 在写出后立刻触发，时机几乎不变；
+    // 异步响应体则在最后一块落地时才触发，这样 status / body_bytes /
+    // elapsed 才是真实值。请求视图在回调返回后失效，所以先做一份快照。
     if (!d.afters.empty()) {
-        ResponseSummary sum;
-        sum.status     = out.status_code();
-        sum.body_bytes = out.body_bytes();
-        sum.upgraded   = out.upgraded();
-        sum.keep_alive = req.keep_alive;
-        sum.elapsed    = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - t0);
-
-        for (auto& hook : d.afters) {
-            hook(req, sum);
+        struct AfterContext {
+            HttpRequest req{};
+            std::string method_text, target, path, query;
+            Headers     headers;
+        };
+        auto ctx = std::make_shared<AfterContext>();
+        ctx->method_text = std::string{req.method_text};
+        ctx->target      = std::string{req.target};
+        ctx->path        = std::string{req.path};
+        ctx->query       = std::string{req.query};
+        for (const auto& f : req.headers.all()) {
+            ctx->headers.add(f.name, f.value);
         }
+        ctx->req                    = req;
+        ctx->req.method_text        = ctx->method_text;
+        ctx->req.target             = ctx->target;
+        ctx->req.path               = ctx->path;
+        ctx->req.query              = ctx->query;
+        ctx->req.headers            = ctx->headers.view();
+        ctx->req.body               = {};
+        ctx->req.user               = req.user;
+        ctx->req.from_trusted_proxy = req.from_trusted_proxy;
+
+        std::weak_ptr<Router> weak = weak_from_this();
+        out.set_completion_hook_([weak, ctx](const ResponseSummary& res) {
+            if (auto self = weak.lock()) {
+                for (auto& hook : self->m_impl->afters) {
+                    hook(ctx->req, res);
+                }
+            }
+        });
     }
 }
 

@@ -105,6 +105,7 @@ enum class Status : std::uint16_t {
     payload_too_large   = 413,
     uri_too_long        = 414,
     unsupported_media   = 415,
+    range_not_satisfiable = 416,
     expectation_failed  = 417,
     teapot              = 418,   ///< 保留，测试用
     too_many_requests   = 429,

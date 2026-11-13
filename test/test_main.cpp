@@ -8,10 +8,13 @@
 // 只有 linger_zero 那个用例需要直接构造 netmech 的 Mechanism
 #include <netmech/mechanism.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <atomic>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <memory>
 #include <string>
@@ -409,6 +412,77 @@ void test_parser_length_validation()
     }
 }
 
+// =============================================================================
+//  静态文件：纯逻辑用例（跨平台，Windows 也跑）
+// =============================================================================
+void test_static_file_utils()
+{
+    g_case = "static file utils";
+    using namespace httpmech;
+
+    // --- 路径校验 ---
+    CHECK(is_safe_url_path("/"));
+    CHECK(is_safe_url_path("/a/b.txt"));
+    CHECK(is_safe_url_path("/dir/"));
+    CHECK(!is_safe_url_path(""));
+    CHECK(!is_safe_url_path("a/b"));
+    CHECK(!is_safe_url_path("/../secret"));
+    CHECK(!is_safe_url_path("/a/../b"));
+    CHECK(!is_safe_url_path("/a//b"));
+    CHECK(!is_safe_url_path("/a\\b"));
+    CHECK(!is_safe_url_path("/a/ "));
+    CHECK(!is_safe_url_path("/a."));
+    {
+        std::string with_nul{"/a"};
+        with_nul.push_back('\0');
+        with_nul += "b";
+        CHECK(!is_safe_url_path(with_nul));
+    }
+
+    // --- percent 解码 + 解码后再校验 ---
+    std::string out;
+    CHECK(percent_decode_path("/a%20b/%2e%2e/c", out));
+    CHECK_EQ(out, std::string{"/a b/../c"});
+    CHECK(!is_safe_url_path(out));
+    CHECK(percent_decode_path("/%41.txt", out));
+    CHECK_EQ(out, std::string{"/A.txt"});
+    CHECK(is_safe_url_path(out));
+    CHECK(!percent_decode_path("/a%", out));
+    CHECK(!percent_decode_path("/a%0", out));
+    CHECK(!percent_decode_path("/a%G1", out));
+
+    // --- MIME ---
+    CHECK_EQ(std::string{mime_type_for_extension("txt")}, std::string{"text/plain"});
+    CHECK_EQ(std::string{mime_type_for_extension(".TXT")}, std::string{"text/plain"});
+    CHECK_EQ(std::string{mime_type_for_extension("JPG")}, std::string{"image/jpeg"});
+    CHECK(mime_type_for_extension("no_such_ext").empty());
+
+    // --- 416 枚举与标准短语 ---
+    CHECK(status_from(416) == Status::range_not_satisfiable);
+    CHECK_EQ(std::string{reason_phrase(Status::range_not_satisfiable)},
+             std::string{"Range Not Satisfiable"});
+
+    // --- 配置校验 ---
+    StaticFileConfig bad;
+    bad.root = "";
+    StaticFileHandler h0{bad};
+    CHECK(!h0.valid());
+    CHECK(!h0.error_message().empty());
+
+    StaticFileConfig bad2;
+    bad2.mount_point = "static";
+    bad2.root = ".";
+    StaticFileHandler h1{bad2};
+    CHECK(!h1.valid());
+
+    StaticFileConfig ok;
+    ok.root = ".";
+    StaticFileHandler h2{ok};
+    CHECK(h2.valid());
+    CHECK(!h2.resolved_root().empty());
+    CHECK_EQ(h2.config().index_file, std::string{"index.html"});
+    CHECK(mount_static(nullptr, std::move(ok))->valid());
+}
 
 #if !defined(_WIN32)
 
@@ -1821,6 +1895,478 @@ void test_ws_app_close_single_frame()
     srv->stop();
 }
 
+// =============================================================================
+//  静态文件：端到端（用本块内的 POSIX socket 辅助函数）
+// =============================================================================
+void test_static_file_e2e()
+{
+    g_case = "static file e2e";
+    namespace fs = std::filesystem;
+    using namespace httpmech;
+
+    std::error_code fec;
+    const fs::path dir = fs::temp_directory_path(fec) / "httpmech_static_ut";
+    if (fec) { CHECK(false); return; }
+    fs::remove_all(dir, fec);
+    fs::create_directories(dir / "sub", fec);
+
+    const std::string payload = "0123456789abcdef";
+    { std::ofstream f{dir / "hello.txt", std::ios::binary}; f << payload; }
+    { std::ofstream f{dir / "index.html", std::ios::binary}; f << "<h1>hi</h1>"; }
+    { std::ofstream f{dir / "sub" / "index.html", std::ios::binary}; f << "SUBINDEX"; }
+
+    StaticFileConfig sf;
+    sf.root        = dir.string();
+    sf.mount_point = "/static";
+    // max_file_bytes 默认 0 = 不限制（阶段 3 起不再是内存约束）
+    sf.extra_headers.set("Cache-Control", "public, max-age=60");
+
+    ServerConfig cfg;
+    cfg.local                 = {"127.0.0.1", 0};
+    cfg.emit_date             = false;
+    cfg.server_name           = "httpmech-ut";
+    cfg.max_buffered_response = sf.max_file_bytes;
+
+    auto router = std::make_shared<Router>();
+    router->get("/api/status", [](const HttpRequest&, ResponseWriter& out) {
+        out.set_content_type("application/json");
+        out.write(R"({"ok":true})");
+        out.end();
+    });
+    auto files = mount_static(router, std::move(sf));
+    CHECK(files->valid());
+
+    auto srv = HttpServer::create(cfg, router);
+    REQUIRE(srv != nullptr);
+    CHECK(!srv->start());
+    const std::uint16_t port = srv->local().port();
+    CHECK(port != 0);
+
+    // 每条请求单独建连接并显式 close，HEAD 等无 body 的响应靠 FIN 收尾。
+    auto request = [port](const std::string& head) {
+        const int fd = tcp_connect("127.0.0.1", port);
+        if (fd < 0) { return std::string{}; }
+        const std::string r =
+            tcp_roundtrip(fd, head + "Host: t\r\nConnection: close\r\n\r\n");
+        ::close(fd);
+        return r;
+    };
+    auto header = [](const std::string& r, const char* name) {
+        const std::string key = std::string{name} + ": ";
+        const auto p = r.find(key);
+        if (p == std::string::npos) { return std::string{}; }
+        const auto e = r.find("\r\n", p);
+        return e == std::string::npos
+                   ? std::string{}
+                   : r.substr(p + key.size(), e - p - key.size());
+    };
+
+    // 1) 基本 GET
+    auto r = request("GET /static/hello.txt HTTP/1.1\r\n");
+    CHECK(r.rfind("HTTP/1.1 200 OK", 0) == 0);
+    CHECK_EQ(header(r, "Content-Length"), std::to_string(payload.size()));
+    CHECK_EQ(header(r, "Content-Type"), std::string{"text/plain"});
+    CHECK_EQ(header(r, "Cache-Control"), std::string{"public, max-age=60"});
+    CHECK(r.find("Accept-Ranges: bytes") != std::string::npos);
+    CHECK(r.find("\r\n\r\n" + payload) != std::string::npos);
+    const std::string etag = header(r, "ETag");
+    const std::string lm   = header(r, "Last-Modified");
+    CHECK(!etag.empty());
+    CHECK(!lm.empty());
+
+    // 2) mount 段边界 + 精确路由优先
+    CHECK(request("GET / HTTP/1.1\r\n").rfind("HTTP/1.1 404", 0) == 0);
+    CHECK(request("GET /statics/x HTTP/1.1\r\n").rfind("HTTP/1.1 404", 0) == 0);
+    r = request("GET /api/status HTTP/1.1\r\n");
+    CHECK(r.rfind("HTTP/1.1 200 OK", 0) == 0);
+    CHECK(r.find(R"({"ok":true})") != std::string::npos);
+
+    // 3) 目录索引 / 301 / 404
+    r = request("GET /static/ HTTP/1.1\r\n");
+    CHECK(r.rfind("HTTP/1.1 200 OK", 0) == 0);
+    CHECK(r.find("<h1>hi</h1>") != std::string::npos);
+    r = request("GET /static/sub HTTP/1.1\r\n");
+    CHECK(r.rfind("HTTP/1.1 301", 0) == 0);
+    CHECK_EQ(header(r, "Location"), std::string{"/static/sub/"});
+    CHECK(request("GET /static/sub/ HTTP/1.1\r\n").find("SUBINDEX") != std::string::npos);
+    CHECK(request("GET /static/missing.txt HTTP/1.1\r\n").rfind("HTTP/1.1 404", 0) == 0);
+
+    // 4) HEAD：只发长度，不发 body
+    r = request("HEAD /static/hello.txt HTTP/1.1\r\n");
+    CHECK(r.rfind("HTTP/1.1 200 OK", 0) == 0);
+    CHECK_EQ(header(r, "Content-Length"), std::to_string(payload.size()));
+    CHECK(r.find("\r\n\r\n" + payload) == std::string::npos);
+
+    // 5) 单段 Range / 416 / 条件请求
+    r = request("GET /static/hello.txt HTTP/1.1\r\nRange: bytes=0-4\r\n");
+    CHECK(r.rfind("HTTP/1.1 206", 0) == 0);
+    CHECK_EQ(header(r, "Content-Range"), std::string{"bytes 0-4/16"});
+    CHECK_EQ(header(r, "Content-Length"), std::string{"5"});
+    CHECK(r.find("\r\n\r\n01234") != std::string::npos);
+    r = request("GET /static/hello.txt HTTP/1.1\r\nRange: bytes=-4\r\n");
+    CHECK(r.rfind("HTTP/1.1 206", 0) == 0);
+    CHECK(r.find("\r\n\r\ncdef") != std::string::npos);
+    r = request("GET /static/hello.txt HTTP/1.1\r\nRange: bytes=100-200\r\n");
+    CHECK(r.rfind("HTTP/1.1 416", 0) == 0);
+    CHECK_EQ(header(r, "Content-Range"), std::string{"bytes */16"});
+    CHECK(request("GET /static/hello.txt HTTP/1.1\r\nIf-None-Match: " + etag + "\r\n")
+              .rfind("HTTP/1.1 304", 0) == 0);
+    CHECK(request("GET /static/hello.txt HTTP/1.1\r\nIf-None-Match: *\r\n")
+              .rfind("HTTP/1.1 304", 0) == 0);
+    CHECK(request("GET /static/hello.txt HTTP/1.1\r\nIf-Modified-Since: " + lm + "\r\n")
+              .rfind("HTTP/1.1 304", 0) == 0);
+
+    // 5b) 阶段 4：多段 Range / 段数上限 / If-Range 强校验
+    r = request("GET /static/hello.txt HTTP/1.1\r\nRange: bytes=0-3,8-11\r\n");
+    CHECK(r.rfind("HTTP/1.1 206", 0) == 0);
+    CHECK(r.find("Content-Type: multipart/byteranges; boundary=") != std::string::npos);
+    CHECK(r.find("Content-Range: bytes 0-3/16") != std::string::npos);
+    CHECK(r.find("Content-Range: bytes 8-11/16") != std::string::npos);
+    CHECK(r.find("\r\n\r\n0123\r\n") != std::string::npos);
+    CHECK(r.find("\r\n\r\n89ab\r\n") != std::string::npos);
+    CHECK(r.find("--httpmech-") != std::string::npos);
+    {
+        const auto he = r.find("\r\n\r\n");
+        REQUIRE(he != std::string::npos);
+        CHECK(r.substr(0, he).find("Content-Range:") == std::string::npos);
+        CHECK_EQ(header(r, "Content-Length"), std::to_string(r.size() - he - 4));
+    }
+    {
+        std::string many = "Range: bytes=";
+        for (int i = 0; i < 40; ++i) {
+            if (i != 0) { many += ","; }
+            many += "0-0";
+        }
+        many += "\r\n";
+        CHECK(request("GET /static/hello.txt HTTP/1.1\r\n" + many)
+                  .rfind("HTTP/1.1 416", 0) == 0);
+    }
+    r = request("GET /static/hello.txt HTTP/1.1\r\nRange: bytes=0-4\r\n"
+                "If-Range: \"deadbeef\"\r\n");
+    CHECK(r.rfind("HTTP/1.1 200 OK", 0) == 0);   // 校验器不匹配 → 忽略 Range
+    CHECK(r.find("\r\n\r\n0123456789abcdef") != std::string::npos);
+
+    // 6) 路径穿越 / 方法限制
+    CHECK(request("GET /static/../hello.txt HTTP/1.1\r\n")
+              .rfind("HTTP/1.1 403", 0) == 0);
+    CHECK(request("GET /static/%2e%2e/hello.txt HTTP/1.1\r\n")
+              .rfind("HTTP/1.1 403", 0) == 0);
+    r = request("POST /static/hello.txt HTTP/1.1\r\n");
+    CHECK(r.rfind("HTTP/1.1 405", 0) == 0);
+    CHECK_EQ(header(r, "Allow"), std::string{"GET, HEAD"});
+
+    srv->stop();
+    fs::remove_all(dir, fec);
+}
+
+// =============================================================================
+//  阶段 2：异步响应体（POSIX e2e）
+// =============================================================================
+void test_body_provider_e2e()
+{
+    g_case = "body provider e2e";
+    using namespace httpmech;
+
+    std::string big(1024 * 1024 + 123, '\0');
+    for (std::size_t i = 0; i < big.size(); ++i) {
+        big[i] = static_cast<char>('A' + (i % 26));
+    }
+
+    ServerConfig cfg;
+    cfg.local                 = {"127.0.0.1", 0};
+    cfg.emit_date             = false;
+    cfg.server_name           = "httpmech-ut";
+    cfg.max_buffered_response = 64 * 1024;        // 故意远小于文件：不许切 chunked
+    cfg.max_send_queue_bytes  = 2 * 1024 * 1024;
+
+    std::atomic<int>           after_calls{0};
+    std::atomic<std::size_t>   after_bytes{0};
+    std::atomic<std::uint16_t> after_status{0};
+    std::atomic<int>           provider_chunks{0};
+
+    auto router = std::make_shared<Router>();
+    // Router::get() 不自动服务 HEAD，两个方法都要注册（与 cpp-httplib 不同）。
+    auto big_handler = [&](const HttpRequest&, ResponseWriter& out) {
+        out.set_content_type("application/octet-stream");
+        out.set_body_provider(BodyProviderSpec{
+            big.size(),
+            [&](std::uint64_t off, std::size_t len, DataSink& sink) {
+                ++provider_chunks;
+                const auto n = (std::min)(len,
+                    big.size() - static_cast<std::size_t>(off));
+                if (n == 0) { return true; }
+                return sink.write(span<const std::uint8_t>{
+                    reinterpret_cast<const std::uint8_t*>(big.data() + off), n});
+            }});
+        out.end();
+    };
+    router->get("/big", big_handler);
+    router->head("/big", big_handler);
+    router->get("/chunked", [](const HttpRequest&, ResponseWriter& out) {
+        out.set_content_type("text/plain");
+        out.set_body_provider(BodyProviderSpec{
+            0,   // 未知长度 → chunked，provider 调 done() 结束
+            [](std::uint64_t off, std::size_t len, DataSink& sink) {
+                if (off >= 10) { sink.done(); return true; }
+                static const char data[] = "0123456789";
+                const auto n = (std::min)(len,
+                    std::size_t{10} - static_cast<std::size_t>(off));
+                return sink.write(std::string_view{data + off, n});
+            }});
+        out.end();
+    });
+    router->get("/stuck", [](const HttpRequest&, ResponseWriter& out) {
+        out.set_body_provider(BodyProviderSpec{
+            100,
+            [](std::uint64_t, std::size_t, DataSink&) { return true; }});   // 无进展
+        out.end();
+    });
+    router->after([&](const HttpRequest&, const ResponseSummary& res) {
+        after_status.store(res.status);
+        after_bytes.store(res.body_bytes);
+        ++after_calls;
+    });
+
+    auto srv = HttpServer::create(cfg, router);
+    REQUIRE(srv != nullptr);
+    CHECK(!srv->start());
+    const std::uint16_t port = srv->local().port();
+    CHECK(port != 0);
+
+    auto header = [](const std::string& r, const char* name) {
+        const std::string key = std::string{name} + ": ";
+        const auto p = r.find(key);
+        if (p == std::string::npos) { return std::string{}; }
+        const auto e = r.find("\r\n", p);
+        return e == std::string::npos
+                   ? std::string{}
+                   : r.substr(p + key.size(), e - p - key.size());
+    };
+    auto recv_to_eof = [](int fd) {
+        std::string out;
+        char buf[4096];
+        for (;;) {
+            const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+            if (n <= 0) { break; }
+            out.append(buf, static_cast<std::size_t>(n));
+        }
+        return out;
+    };
+
+    // 1) 已知长度的大响应：Content-Length 定帧、内容完整、分多块投递
+    {
+        const int fd = tcp_connect("127.0.0.1", port);
+        REQUIRE(fd >= 0);
+        const std::string r = tcp_roundtrip(
+            fd, "GET /big HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+        ::close(fd);
+        CHECK(r.rfind("HTTP/1.1 200 OK", 0) == 0);
+        CHECK(r.find("Transfer-Encoding") == std::string::npos);
+        CHECK_EQ(header(r, "Content-Length"), std::to_string(big.size()));
+        const auto pos = r.find("\r\n\r\n");
+        REQUIRE(pos != std::string::npos);
+        CHECK(r.substr(pos + 4) == big);
+    }
+    CHECK(provider_chunks.load() >= 5);
+
+    // after 钩子必须等异步响应真正结束才触发，且统计是累计值
+    for (int i = 0; i < 200 && after_calls.load() == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    }
+    CHECK_EQ(after_calls.load(), 1);
+    CHECK_EQ(after_status.load(), std::uint16_t{200});
+    CHECK_EQ(after_bytes.load(), big.size());
+
+    // 2) HEAD：只报长度，不启动状态机（provider_chunks 不应增加）
+    const int chunks_before_head = provider_chunks.load();
+    {
+        const int fd = tcp_connect("127.0.0.1", port);
+        REQUIRE(fd >= 0);
+        const std::string r = tcp_roundtrip(
+            fd, "HEAD /big HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+        ::close(fd);
+        CHECK(r.rfind("HTTP/1.1 200 OK", 0) == 0);
+        CHECK_EQ(header(r, "Content-Length"), std::to_string(big.size()));
+        CHECK(r.find("AAAAAAAA") == std::string::npos);
+    }
+    CHECK_EQ(provider_chunks.load(), chunks_before_head);
+
+    // 3) 未知长度 chunked provider：终止块完整送达
+    {
+        const int fd = tcp_connect("127.0.0.1", port);
+        REQUIRE(fd >= 0);
+        const std::string req =
+            "GET /chunked HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+        CHECK(::send(fd, req.data(), req.size(), 0) > 0);
+        const std::string r = recv_to_eof(fd);
+        ::close(fd);
+        CHECK(r.rfind("HTTP/1.1 200 OK", 0) == 0);
+        CHECK(r.find("Transfer-Encoding: chunked") != std::string::npos);
+        CHECK(r.find("\r\n\r\na\r\n0123456789\r\n0\r\n\r\n") != std::string::npos);
+    }
+
+    // 4) provider 无进展：库要断开，不能死循环，也不能给出完整 body
+    {
+        const int fd = tcp_connect("127.0.0.1", port);
+        REQUIRE(fd >= 0);
+        const std::string r = tcp_roundtrip(
+            fd, "GET /stuck HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+        ::close(fd);
+        CHECK(r.rfind("HTTP/1.1 200 OK", 0) == 0);
+        const auto pos = r.find("\r\n\r\n");
+        REQUIRE(pos != std::string::npos);
+        CHECK(r.size() < pos + 4 + 100);
+    }
+
+    srv->stop();
+}
+
+// =============================================================================
+//  阶段 3：静态文件大文件 / 背压 / keep-alive 复用（POSIX e2e）
+// =============================================================================
+void test_static_file_large_e2e()
+{
+    g_case = "static file large e2e";
+    namespace fs = std::filesystem;
+    using namespace httpmech;
+
+    std::error_code fec;
+    const fs::path dir = fs::temp_directory_path(fec) / "httpmech_static_large_ut";
+    if (fec) { CHECK(false); return; }
+    fs::remove_all(dir, fec);
+    fs::create_directories(dir, fec);
+
+    std::string big(2 * 1024 * 1024 + 77, '\0');
+    for (std::size_t i = 0; i < big.size(); ++i) {
+        big[i] = static_cast<char>('a' + (i % 26));
+    }
+    {
+        std::ofstream f{dir / "big.bin", std::ios::binary};
+        f.write(big.data(), static_cast<std::streamsize>(big.size()));
+    }
+
+    StaticFileConfig sf;
+    sf.root        = dir.string();
+    sf.mount_point = "/files";
+    CHECK_EQ(sf.max_file_bytes, std::size_t{0});   // 默认不限制
+
+    ServerConfig cfg;
+    cfg.local                 = {"127.0.0.1", 0};
+    cfg.emit_date             = false;
+    cfg.server_name           = "httpmech-ut";
+    cfg.max_buffered_response = 64 * 1024;        // 阶段 1 会冲突，阶段 3 不受影响
+    cfg.max_send_queue_bytes  = 1024 * 1024;
+
+    auto router = std::make_shared<Router>();
+    router->get("/api/ping", [](const HttpRequest&, ResponseWriter& out) {
+        out.set_content_type("text/plain");
+        out.write("pong");
+        out.end();
+    });
+    auto files = mount_static(router, std::move(sf));
+    REQUIRE(files->valid());
+
+    auto srv = HttpServer::create(cfg, router);
+    REQUIRE(srv != nullptr);
+    CHECK(!srv->start());
+    const std::uint16_t port = srv->local().port();
+    CHECK(port != 0);
+
+    auto header = [](const std::string& r, const char* name) {
+        const std::string key = std::string{name} + ": ";
+        const auto p = r.find(key);
+        if (p == std::string::npos) { return std::string{}; }
+        const auto e = r.find("\r\n", p);
+        return e == std::string::npos
+                   ? std::string{}
+                   : r.substr(p + key.size(), e - p - key.size());
+    };
+    auto request = [port](const std::string& head) {
+        const int fd = tcp_connect("127.0.0.1", port);
+        if (fd < 0) { return std::string{}; }
+        const std::string r = tcp_roundtrip(
+            fd, head + "Host: t\r\nConnection: close\r\n\r\n");
+        ::close(fd);
+        return r;
+    };
+    auto recv_to_eof = [](int fd) {
+        std::string out;
+        char buf[4096];
+        for (;;) {
+            const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+            if (n <= 0) { break; }
+            out.append(buf, static_cast<std::size_t>(n));
+        }
+        return out;
+    };
+
+    // 1) 2 MiB 文件完整送达，且没有切 chunked
+    {
+        const auto r = request("GET /files/big.bin HTTP/1.1\r\n");
+        CHECK(r.rfind("HTTP/1.1 200 OK", 0) == 0);
+        CHECK(r.find("Transfer-Encoding") == std::string::npos);
+        CHECK_EQ(header(r, "Content-Length"), std::to_string(big.size()));
+        const auto p = r.find("\r\n\r\n");
+        REQUIRE(p != std::string::npos);
+        CHECK(r.substr(p + 4) == big);
+    }
+
+    // 2) 大偏移单段 Range
+    {
+        const auto r = request(
+            "GET /files/big.bin HTTP/1.1\r\nRange: bytes=1048576-1048599\r\n");
+        CHECK(r.rfind("HTTP/1.1 206", 0) == 0);
+        CHECK_EQ(header(r, "Content-Range"),
+                 std::string{"bytes 1048576-1048599/"} + std::to_string(big.size()));
+        const auto p = r.find("\r\n\r\n");
+        REQUIRE(p != std::string::npos);
+        CHECK(r.substr(p + 4) == big.substr(1048576, 24));
+    }
+
+    // 3) HEAD 只报长度
+    {
+        const auto r = request("HEAD /files/big.bin HTTP/1.1\r\n");
+        CHECK(r.rfind("HTTP/1.1 200 OK", 0) == 0);
+        CHECK_EQ(header(r, "Content-Length"), std::to_string(big.size()));
+        CHECK(r.find("abcdefgh") == std::string::npos);
+    }
+
+    // 4) 慢客户端：发完请求先不读，过一会儿再收，内容仍完整（背压不丢数据）
+    {
+        const int fd = tcp_connect("127.0.0.1", port);
+        REQUIRE(fd >= 0);
+        const std::string req =
+            "GET /files/big.bin HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+        CHECK(::send(fd, req.data(), req.size(), 0) > 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds{150});
+        const auto r = recv_to_eof(fd);
+        ::close(fd);
+        CHECK(r.rfind("HTTP/1.1 200 OK", 0) == 0);
+        const auto p = r.find("\r\n\r\n");
+        REQUIRE(p != std::string::npos);
+        CHECK(r.substr(p + 4) == big);
+    }
+
+    // 5) keep-alive 复用：同一连接上「普通路由 → 大文件」都能正确收尾
+    {
+        const int fd = tcp_connect("127.0.0.1", port);
+        REQUIRE(fd >= 0);
+        const auto r1 = tcp_roundtrip(fd, "GET /api/ping HTTP/1.1\r\nHost: t\r\n\r\n");
+        CHECK(r1.rfind("HTTP/1.1 200 OK", 0) == 0);
+        CHECK(r1.find("pong") != std::string::npos);
+        const auto r2 = tcp_roundtrip(
+            fd, "GET /files/big.bin HTTP/1.1\r\nHost: t\r\n\r\n");
+        CHECK(r2.rfind("HTTP/1.1 200 OK", 0) == 0);
+        const auto p = r2.find("\r\n\r\n");
+        REQUIRE(p != std::string::npos);
+        CHECK(r2.substr(p + 4) == big);
+        ::close(fd);
+    }
+
+    srv->stop();
+    fs::remove_all(dir, fec);
+}
+
 #endif // !_WIN32
 
 } // namespace
@@ -1857,7 +2403,11 @@ int main()
         {"headers container",   test_headers_container},
         {"websocket accept",    test_websocket_accept},
         {"status",              test_status},
+        {"static file utils",   test_static_file_utils},
 #if !defined(_WIN32)
+        {"body provider e2e",   test_body_provider_e2e},
+        {"static file e2e",     test_static_file_e2e},
+        {"static file large e2e", test_static_file_large_e2e},
         {"server e2e",          test_server_e2e},
         {"connection close",    test_connection_close_delivery},
         {"response chunked streaming", test_response_chunked_streaming},

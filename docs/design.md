@@ -8,8 +8,10 @@
 ## 1. 定位与范围
 
 **HTTP/1.1 与 WebSocket 的服务端协议层**，站在 netmech 的 TCP 之上。
-部署形态固定为 **nginx 在前**：TLS、HTTP/2、限流、静态文件都由 nginx 负责，
-本库只处理 nginx 转过来的明文 HTTP/1.1 与 WebSocket。
+典型部署为 **nginx 在前**：TLS、HTTP/2、限流由 nginx 负责，
+本库只处理转过来的明文 HTTP/1.1 与 WebSocket。
+静态文件由可选的 `StaticFileHandler` 组件承担（小文件，见 §10），
+大文件与高并发静态服务仍建议交给 nginx。
 
 ```
 浏览器 ──HTTPS/WSS──► nginx ──HTTP/1.1 明文──► httpmech ──► netmech ──► TCP
@@ -38,7 +40,8 @@
 | **业务纤程 / 线程池** | 参考实现用 boost fiber 跑业务；本库只给回调，耗时活儿由接入方自己丢线程池 |
 | **HTTP / WebSocket 客户端** | 第一阶段不需要；接口形状先放着（`client.hpp`，标 v0.2） |
 | 路径参数 `:id`、通配符、正则路由 | 十几条接口用精确匹配就够，参数解析是复杂度源头 |
-| 静态文件服务 | nginx 的 `root` / `try_files` 比我们做得好 |
+| ~~静态文件服务~~ | **已作为可选组件补上**：`StaticFileHandler` + 通用异步响应体通道，支持任意大小文件与背压，见 §10 |
+| 真·sendfile / mmap 零拷贝 / 目录列表 / gzip | 仍不做：分块投递已够用；压缩破坏零外部依赖约定，nginx 可代劳 |
 | gzip、multipart、cookie 罐 | 属应用语义或由 nginx 处理 |
 
 ---
@@ -252,7 +255,14 @@ nginx 与进程同机时配 `{"127.0.0.1"}`。
 |---|---|
 | **v0.1** | HTTP/1.1 服务端 + 路由 + WebSocket 服务端 + 代理头识别 |
 | v0.2 | `HttpClient` / `WebSocketClient`（设备主动出站时） |
-| v0.3 | 视需要：连接数/请求数指标导出、`send_file()`（sendfile 或 mmap） |
+| v0.3 | 视需要：连接数/请求数指标导出、mmap 零拷贝 |
+| 已补 | `StaticFileHandler` + `set_body_provider()` 异步响应体通道 + 多段 Range（阶段 1-4），见 §10 |
+
+> `send_file()` 的目标已收敛：cpp-httplib 用 mmap/pread + 256 KiB 缓冲即可满足
+> 大文件，并不需要真·sendfile。实际落地的是 **扩展 `ResponseWriter` 的异步
+> 写完成回调 + 背压**（`on_write` 驱动下一块、`set_send_queue_limit` 限队列），
+> 没有改 netmech 的文件句柄通道。真·零拷贝已评估：分块投递的内存与拷贝开销
+> 已足够低，引入平台相关映射代码收益有限，留作后续可选优化。
 
 ---
 
@@ -286,16 +296,84 @@ nginx 与进程同机时配 `{"127.0.0.1"}`。
 | `router` | ✅ | 精确路由 + before/after + 405/Allow |
 | `websocket` | ✅ | 握手（SHA-1 + Base64 自带）、帧层、分片、ping/pong、close 握手、空闲与 ping 定时 |
 | `client` | ✅ | HttpClient（串行队列 / keep-alive / chunked）+ WebSocketClient（掩码发起 + 握手校验） |
+| `response_body` | ✅ | `DataSink` / `ContentProvider` / `BodyProviderSpec`；写完成驱动、背压、完成回调 |
+| `static_file` | ✅（阶段 1-4） | 可选组件：路径安全、MIME、304、单段/多段 Range、HEAD、任意大小文件、慢客户端背压 |
 
 ### 与设计稿的偏差（实现时发现，已在代码注释里标出）
 
 | 设计稿写的 | 实际实现 | 原因 |
 |---|---|---|
-| 响应超 64 KiB 自动 chunked | 响应整块缓冲，按 `Content-Length` 发 | 自动 chunked 要求"第一次 write 就定死头部"，属于流式响应；v0.1 的接口（应用只在 `end()` 时收尾）表达不了。JSON 接口够用，流式下一阶段做 |
+| 响应超 64 KiB 自动 chunked | **已实现**：`write()` 超阈值自动切 chunked；另有 `set_body_provider()` 通道，已知长度走 `Content-Length` | 老路径长度未知用 chunked 是对的；新路径给大文件/静态资源用，两者并存，见 §10 |
 
 > 另两条曾经的偏差（`local()` 拿不到真实端口、`stop()` 只能 `close_all()`）
 > **已经通过补 netmech 接口解决**：`Mechanism::unlisten()` /
 > `listening_address()` / `listening_addresses()`。见下节。
+
+### 静态文件组件与异步响应体（阶段 1 → 3 已完成）
+
+参考 cpp-httplib 0.66.0 的 `set_mount_point` / `handle_file_request` /
+`apply_ranges`，但两者**线程模型不同**，不能照抄发送链路：
+
+| | cpp-httplib | httpmech |
+|---|---|---|
+| I/O | 阻塞 socket + 每连接一线程 | netmech 异步 io 线程，回调禁止阻塞 |
+| 大文件 | `write_content_with_progress()` 同步 while 循环，阻塞写即背压 | `on_write()` → `Conn::post()` → `pump_provider()` 状态机 |
+| 文件表示 | `mmap`/`pread` + 256 KiB 缓冲 | `ifstream` 每轮 read 256 KiB，`ConstBuf.owner` 保活在途块 |
+
+**阶段 2：通用异步响应体通道**（`include/httpmech/response_body.hpp`）
+
+- `ContentProvider(offset, length, DataSink&)` 接口形状对齐 cpp-httplib，
+  但 `DataSink::write()` 是「投递一个 `ConstBuf`」而非同步阻塞写；
+- `ResponseWriter::set_body_provider(BodyProviderSpec{length, provider})`：
+  `length > 0` 走 `Content-Length`（含 206 的 `Content-Range`、HEAD 只报长度），
+  `length == 0` 走 chunked，由 provider 调 `done()` 结束；
+- `ServerSession::on_write()` 在 `m_inflight` 归零后经 `Conn::post()` 回 io
+  线程驱动下一块，每连接最多 1 块在途 —— 这就是背压；
+- `on_open()` 调 `Conn::set_send_queue_limit(cfg.max_send_queue_bytes, 0)`；
+- provider 期间 `pump()` 提前返回、暂停读、跳过 idle 检查，避免解析器未
+  reset 时把同一条消息反复派发（实现时实际踩到的坑）；
+- `body_bytes()` 改累计统计；`after` 钩子改由「响应完成」事件驱动，
+  Router 注册时快照请求视图，异步响应的 status / body_bytes / elapsed 才准确；
+- `ServerConfig` **末尾追加** `max_send_queue_bytes`（ABI 变更，SHARED 使用方需重编）。
+
+**阶段 3：静态文件接入**
+
+- `serve()` 注册 provider 按 256 KiB 分块读，删除 501 与一次性读文件；
+- `max_file_bytes` 默认 0（不限制），非 0 只是业务策略（超过回 403）；
+- 不再受 `max_buffered_response` 约束；Range 按 offset/length 切片，支持大偏移；
+- HEAD 只注册 provider 拿 `Content-Length`，不启动状态机、不打开文件。
+
+**借鉴 cpp-httplib 的部分**（`src/static_file.cpp`）：
+
+- `is_valid_path` 的路径校验口径：拒 NUL / `\` / 控制字符、Windows 拒 `:`
+  （NTFS 流）、拒空段与以 `.`/空格结尾的段；
+- `canonicalize_path` + `is_path_within_base` 两段式：注册时解析 root，
+  请求时 `weakly_canonical()` 后做前缀比较，挡 symlink/junction 逃逸；
+- mount 的**路径段边界**前缀匹配（`/static` 不吞 `/statics/x`）；
+- 挂载级额外响应头、扩展名→MIME 映射与默认类型；
+- 处理顺序：`stat` → 304 判定 → If-Range → 打开文件。304 完全不碰文件内容；
+- 弱 ETag `W/"<mtime>-<size>"`、`Last-Modified`、`If-None-Match` 优先于
+  `If-Modified-Since`、单段 `Content-Range`、416。
+
+**阶段 4 已补**：多段 `Range` → `multipart/byteranges`（流式拼装、段数上限
+32 的 DoS 防护、每段自带 `Content-Range`、顶层只带 multipart 的 Content-Type）；
+`If-Range` 严格区分 ETag 形式与 HTTP-date，不匹配的 ETag 一律判失败并忽略
+Range（RFC 9110 §13.1.5）。
+
+**仍不做**：gzip / 静态压缩（零外部依赖约定）、目录列表、真·sendfile / mmap
+零拷贝（已评估：分块投递的内存与拷贝开销足够低，平台映射代码收益有限）。
+provider 目前在 io 线程同步 `read()` 一块，慢速网络盘建议自行挪到业务线程池
+再经 `Conn::post()` 回投。
+
+**执行时按代码实际情况做的两处调整**（与原阶段 2 设想不同）：
+
+1. `start_stream_response()` 的硬编码 chunked **保留**：那条路径服务于
+   `write()` 超阈值，长度本来就未知，chunked 是正确选择；「已知长度走 CL」
+   由新的 provider 分支实现，不必改动老路径。
+2. 三处老反压分支（`start_stream_response` / `send_stream_chunk` /
+   `finish_stream_response`）**保留**：它们属于同步 `write()` API，应用会连续
+   调用、没有暂停点。新通道用「每连接 1 块在途」从源头避免反压，比在
+   `write()` 返回 false 后补救更可靠。
 
 ### 验证
 

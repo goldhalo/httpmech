@@ -113,6 +113,7 @@ Status status_from(std::uint16_t code) noexcept
     case 413: return Status::payload_too_large;
     case 414: return Status::uri_too_long;
     case 415: return Status::unsupported_media;
+    case 416: return Status::range_not_satisfiable;
     case 417: return Status::expectation_failed;
     case 418: return Status::teapot;
     case 429: return Status::too_many_requests;
@@ -153,6 +154,7 @@ const char* reason_phrase(Status s) noexcept
     case Status::payload_too_large:     return "Payload Too Large";
     case Status::uri_too_long:          return "URI Too Long";
     case Status::unsupported_media:     return "Unsupported Media Type";
+    case Status::range_not_satisfiable: return "Range Not Satisfiable";
     case Status::expectation_failed:    return "Expectation Failed";
     case Status::teapot:                return "I'm a teapot";
     case Status::too_many_requests:     return "Too Many Requests";

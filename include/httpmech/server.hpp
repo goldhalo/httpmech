@@ -26,6 +26,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -33,6 +34,7 @@
 #include <vector>
 
 #include <httpmech/common.hpp>
+#include <httpmech/response_body.hpp>
 #include <httpmech/endpoint.hpp>
 #include <httpmech/headers.hpp>
 #include <httpmech/message.hpp>
@@ -49,6 +51,7 @@ namespace httpmech {
 
 class HttpServer;
 class Router;
+struct ResponseSummary;
 namespace detail {
 class ServerSession;   ///< 内部：一条连接，见 src/server.cpp
 } // namespace detail
@@ -112,6 +115,19 @@ public:
     /// 便捷：`404 Not Found` + 一行文本。
     void end_status(Status s, std::string_view text = {});
 
+    /// 注册一个**分块提供**的响应体（大文件 / 大 JSON / 日志流共用）。
+    ///
+    /// 与 `write()` 的区别：`write()` 把数据攒进内存，超过
+    /// `ServerConfig::max_buffered_response` 自动切 chunked；
+    /// `set_body_provider()` 从一开始就不整块缓冲，由写完成回调逐块驱动
+    /// provider，内存占用与文件大小无关，且带发送队列背压。
+    ///
+    /// @param spec.length > 0 时按 Content-Length 定帧（推荐：静态文件、
+    ///        206 单段响应）；== 0 时走 chunked，provider 需调 `done()`。
+    /// @note 调用后仍须 `end()` 收尾；所有响应头必须在此之前设完。
+    ///       同一响应里不要与 `write()` 混用。
+    void set_body_provider(BodyProviderSpec spec);
+
     /// 头部是否已经发出（`write()` 超过缓冲上限、进入 chunked 之后为 true）。
     [[nodiscard]] bool headers_sent() const noexcept;
 
@@ -137,7 +153,8 @@ public:
     /// 当前设定的状态码（after 钩子里记访问日志用）。
     [[nodiscard]] std::uint16_t status_code() const noexcept;
 
-    /// 已写入的 body 字节数。
+    /// 已投递的 body 字节数（**累计值**：切 chunked 或走 body provider 之后
+    /// 也准确，`after` 钩子的 `ResponseSummary::body_bytes` 取的就是它）。
     [[nodiscard]] std::size_t body_bytes() const noexcept;
 
     /// 直接断连，不发响应。用于"这个连接我不想再理了"。
@@ -145,8 +162,15 @@ public:
 
 private:
     friend class HttpServer;
+    friend class Router;               ///< 注册 after 钩子的完成回调
     friend class detail::ServerSession;
     struct Impl;
+
+    /// 供 Router 注册：响应**完全结束**时由库回调一次（同步响应也在
+    /// finish_writer 末尾触发，所以 after 的时机对现有代码几乎不变）。
+    /// 异步响应下必须走这里，否则 status / body_bytes / elapsed 会失真。
+    void set_completion_hook_(std::function<void(const ResponseSummary&)> cb);
+
     explicit ResponseWriter(Impl* impl) noexcept : m_impl(impl) {}
     Impl* m_impl = nullptr;
 };
@@ -291,6 +315,13 @@ struct ServerConfig {
     ///       使 `real_ip()` 开箱即用。若要更严格（例如 nginx 在另一台机器上、
     ///       或压根没有代理），显式改成对应的代理地址，或置空表示**完全不采信**。
     std::vector<std::string> trusted_proxies{"127.0.0.1"};
+
+    /// 单连接发送队列的字节上限（0 = 不限制）。异步响应体用它做背压判据：
+    /// 在途字节达到上限就暂停取下一块，避免慢客户端把内存吃光。
+    /// 启动时传给 `netmech::Conn::set_send_queue_limit()`。
+    /// @note **追加在结构体末尾**：`ServerConfig` 是安装出去的公开结构体，
+    ///       这属于 ABI 变更，SHARED 构建的使用方需重新编译。
+    std::size_t max_send_queue_bytes = 2 * 1024 * 1024;
 };
 
 /// HTTP/1.1 服务端。
