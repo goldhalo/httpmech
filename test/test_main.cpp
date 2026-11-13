@@ -1626,6 +1626,201 @@ void test_server_e2e()
     srv3->stop();
 }
 
+// =============================================================================
+//  M1 回归：协议错误必须回映射后的状态码（400/431），不能被 500 兜底覆盖
+// =============================================================================
+void test_protocol_error_status_codes()
+{
+    g_case = "protocol error status codes";
+
+    httpmech::ServerConfig cfg;
+    cfg.local       = {"127.0.0.1", 0};
+    cfg.emit_date   = false;
+    cfg.server_name = "httpmech-ut";
+    cfg.limits.max_header_bytes = 32;   // 调小头部上限便于触发 431
+
+    auto router = std::make_shared<httpmech::Router>();
+    router->get("/", [](const httpmech::HttpRequest&, httpmech::ResponseWriter& out) {
+        out.end();
+    });
+    auto srv = httpmech::HttpServer::create(cfg, router);
+    REQUIRE(srv != nullptr);
+    REQUIRE(!srv->start());
+    const std::uint16_t port = srv->local().port();
+    REQUIRE(port != 0);
+
+    // 1) 非法请求行 → 400（以前被 finish_writer 的 !ended→500 覆盖成 500）
+    {
+        const int fd = tcp_connect("127.0.0.1", port);
+        REQUIRE(fd >= 0);
+        const std::string r = tcp_roundtrip(fd, "GARBAGE\r\n\r\n");
+        CHECK(r.rfind("HTTP/1.1 400", 0) == 0);
+        ::close(fd);
+    }
+
+    // 2) 头部超限（完整头块 > max_header_bytes）→ 431
+    {
+        const int fd = tcp_connect("127.0.0.1", port);
+        REQUIRE(fd >= 0);
+        const std::string big =
+            "GET / HTTP/1.1\r\nHost: " + std::string(40, 'a') + "\r\n\r\n";
+        const std::string r = tcp_roundtrip(fd, big);
+        CHECK(r.rfind("HTTP/1.1 431", 0) == 0);
+        ::close(fd);
+    }
+
+    srv->stop();
+}
+
+// =============================================================================
+//  M4 回归：validate_utf8=true 时非法 UTF-8 文本帧 → 1007；合法帧正常回显
+// =============================================================================
+void test_ws_validate_utf8()
+{
+    g_case = "ws validate_utf8";
+
+    httpmech::ServerConfig cfg;
+    cfg.local       = {"127.0.0.1", 0};
+    cfg.emit_date   = false;
+    cfg.server_name = "httpmech-ut";
+    cfg.websocket.validate_utf8 = true;   // 以前是死配置，从不读取
+
+    auto router = std::make_shared<httpmech::Router>();
+    httpmech::WebSocketHandlers ws;
+    ws.on_message = [](httpmech::WebSocketSession& s,
+                       httpmech::span<const std::uint8_t> data, bool is_text) {
+        if (is_text) {
+            s.send_text(std::string_view{reinterpret_cast<const char*>(data.data()), data.size()});
+        }
+    };
+    router->websocket("/ws", std::move(ws));
+    auto srv = httpmech::HttpServer::create(cfg, router);
+    REQUIRE(srv != nullptr);
+    REQUIRE(!srv->start());
+    const std::uint16_t port = srv->local().port();
+    REQUIRE(port != 0);
+
+    const std::string key = "dGhlIHNhbXBsZSBub25jZQ==";
+    const std::string hs =
+        "GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\n"
+        "Connection: Upgrade\r\nSec-WebSocket-Key: " + key + "\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n";
+
+    // 1) 非法 UTF-8（0xFF 不是合法首字节）→ close 1007
+    {
+        const int fd = tcp_connect("127.0.0.1", port);
+        REQUIRE(fd >= 0);
+        REQUIRE(tcp_send_all(fd, hs));
+        std::string head;
+        char c = 0;
+        while (head.find("\r\n\r\n") == std::string::npos) {
+            if (!tcp_recv_exact(fd, &c, 1)) { break; }
+            head.push_back(c);
+        }
+        REQUIRE(head.rfind("HTTP/1.1 101", 0) == 0);
+        REQUIRE(tcp_send_all(fd, ws_build_frame(0x1, std::string("\xFF\xFE", 2))));
+        std::uint8_t op = 0;
+        std::string  payload;
+        REQUIRE(ws_read_frame(fd, op, payload));
+        CHECK_EQ(static_cast<int>(op), 0x8);          // close
+        REQUIRE(payload.size() >= 2);
+        const std::uint16_t code =
+            static_cast<std::uint16_t>((static_cast<std::uint8_t>(payload[0]) << 8) |
+                                       static_cast<std::uint8_t>(payload[1]));
+        CHECK_EQ(static_cast<int>(code), 1007);
+        ::close(fd);
+    }
+
+    // 2) 合法 UTF-8（"hello" + 中文）→ 正常回显
+    {
+        const int fd = tcp_connect("127.0.0.1", port);
+        REQUIRE(fd >= 0);
+        REQUIRE(tcp_send_all(fd, hs));
+        std::string head;
+        char c = 0;
+        while (head.find("\r\n\r\n") == std::string::npos) {
+            if (!tcp_recv_exact(fd, &c, 1)) { break; }
+            head.push_back(c);
+        }
+        REQUIRE(head.rfind("HTTP/1.1 101", 0) == 0);
+        const std::string ok = "hello \xE4\xB8\xAD\xE6\x96\x87";   // hello 中文
+        REQUIRE(tcp_send_all(fd, ws_build_frame(0x1, ok)));
+        std::uint8_t op = 0;
+        std::string  payload;
+        REQUIRE(ws_read_frame(fd, op, payload));
+        CHECK_EQ(static_cast<int>(op), 0x1);
+        CHECK_EQ(payload, ok);
+        ::close(fd);
+    }
+
+    srv->stop();
+}
+
+// =============================================================================
+//  M2 回归：应用主动 close() 只发一帧 close（以前发两帧，违反 RFC 6455）
+// =============================================================================
+void test_ws_app_close_single_frame()
+{
+    g_case = "ws app close single frame";
+
+    httpmech::ServerConfig cfg;
+    cfg.local       = {"127.0.0.1", 0};
+    cfg.emit_date   = false;
+    cfg.server_name = "httpmech-ut";
+
+    auto router = std::make_shared<httpmech::Router>();
+    httpmech::WebSocketHandlers ws;
+    ws.on_message = [](httpmech::WebSocketSession& s,
+                       httpmech::span<const std::uint8_t>, bool) {
+        s.close(1000, "bye");   // 应用主动关
+    };
+    router->websocket("/ws", std::move(ws));
+    auto srv = httpmech::HttpServer::create(cfg, router);
+    REQUIRE(srv != nullptr);
+    REQUIRE(!srv->start());
+    const std::uint16_t port = srv->local().port();
+    REQUIRE(port != 0);
+
+    const int fd = tcp_connect("127.0.0.1", port);
+    REQUIRE(fd >= 0);
+    const std::string key = "dGhlIHNhbXBsZSBub25jZQ==";
+    REQUIRE(tcp_send_all(fd,
+        "GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\n"
+        "Connection: Upgrade\r\nSec-WebSocket-Key: " + key + "\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n"));
+    std::string head;
+    char c = 0;
+    while (head.find("\r\n\r\n") == std::string::npos) {
+        if (!tcp_recv_exact(fd, &c, 1)) { break; }
+        head.push_back(c);
+    }
+    REQUIRE(head.rfind("HTTP/1.1 101", 0) == 0);
+
+    REQUIRE(tcp_send_all(fd, ws_build_frame(0x1, "trigger")));
+
+    // 读尽所有帧直到连接关闭，统计 close 帧个数。修前会收到 2 帧 close。
+    int close_frames = 0;
+    for (;;) {
+        std::uint8_t op = 0;
+        std::string  payload;
+        if (!ws_read_frame(fd, op, payload)) {
+            break;
+        }
+        if (op == 0x8) {
+            ++close_frames;
+            // 回一帧 close 让服务端尽快收尾（否则等 2s 兖底）
+            std::string cp;
+            cp.push_back(static_cast<char>(0x03));
+            cp.push_back(static_cast<char>(0xE8));
+            tcp_send_all(fd, ws_build_frame(0x8, cp));
+        }
+    }
+    CHECK_EQ(close_frames, 1);
+
+    ::close(fd);
+    srv->stop();
+}
+
 #endif // !_WIN32
 
 } // namespace
@@ -1678,6 +1873,9 @@ int main()
         {"runtime injection",   test_runtime_injection},
         {"http client chunked", test_http_client_chunked},
         {"websocket client e2e", test_websocket_client_e2e},
+        {"protocol error status codes", test_protocol_error_status_codes},
+        {"ws validate_utf8",    test_ws_validate_utf8},
+        {"ws app close single frame", test_ws_app_close_single_frame},
 #endif
     };
 

@@ -154,7 +154,8 @@ struct HttpClient::Impl : public std::enable_shared_from_this<HttpClient::Impl> 
     void on_connected(std::shared_ptr<HttpClientSession> s);
     void do_connect();
     void complete();                      ///< 清掉在途标记并取下一笔
-    void on_conn_closed();
+    void on_conn_closed(HttpClientSession* s);
+    void retire_conn(HttpClientSession* s);   ///< M6：把指定会话的连接置为不可用
     void fail_all(std::error_code ec);
     void ensure_ticker();
 };
@@ -245,7 +246,7 @@ public:
         }
 
         if (!m_closed.exchange(true)) {
-            m_owner->on_conn_closed();
+            m_owner->on_conn_closed(this);
         }
     }
 
@@ -372,10 +373,14 @@ private:
         if (!ec) {
             ++m_owner->served_on_conn;
         }
-        m_owner->complete();
         if (!keep_alive) {
+            // ★ M6：先把本连接置为不可用并关掉，再让 advance 在新连接上取活。
+            //   以前先 complete()（advance 把下一笔排队请求发到这条即将关闭
+            //   的连接上），后 close_conn() → 排队请求以 not_connected 虚假失败。
+            m_owner->retire_conn(this);
             close_conn();
         }
+        m_owner->complete();
     }
 
     void pump()
@@ -414,7 +419,12 @@ private:
                 break;
 
             case Parser::Result::message_end: {
-                const bool ka = m_parser.response().keep_alive;
+                // 与聚合路径（Result::message）同一套综合判定（m4）：
+                // 以前只看 resp.keep_alive，忽略了 cfg.keep_alive 与
+                // max_requests_per_connection，流式响应会违规复用连接。
+                const HttpResponse& resp = m_parser.response();
+                const bool ka = resp.keep_alive && m_owner->cfg.keep_alive &&
+                                m_owner->served_on_conn < m_owner->cfg.max_requests_per_connection;
                 finish({}, ka);
                 return;
             }
@@ -568,13 +578,26 @@ void HttpClient::Impl::complete()
     advance();
 }
 
-void HttpClient::Impl::on_conn_closed()
+void HttpClient::Impl::retire_conn(HttpClientSession* s)
+{
+    std::lock_guard<std::mutex> lk(mu);
+    if (conn.get() == s) {
+        conn.reset();
+    }
+}
+
+void HttpClient::Impl::on_conn_closed(HttpClientSession* s)
 {
     Job  job;
     bool had         = false;
     bool was_timeout = false;
     {
         std::lock_guard<std::mutex> lk(mu);
+        // ★ M6：只处理"关的是当前连接"。旧连接的迟到关闭通知不能碰
+        //   新连接（否则会虚假失败新连接上的在途请求）。
+        if (conn.get() != s) {
+            return;
+        }
         conn.reset();
         was_timeout = timed_out;
         timed_out   = false;
@@ -731,16 +754,31 @@ struct WebSocketClient::Impl : public std::enable_shared_from_this<WebSocketClie
     WebSocketClientHandlers             handlers;
 
     std::mutex  mu;
-    bool        connecting = false;
-    bool        open       = false;
+    std::atomic<bool> connecting{false};
+    std::atomic<bool> open{false};
     std::string client_key;         ///< 握手用的一次性 key
     std::string expected_accept;    ///< 由它算出来的期望 accept
     std::chrono::steady_clock::time_point handshake_deadline;
 
     std::shared_ptr<netmech::Linkable>     linkable;    ///< 必须保活
+    // ★ conn/ws 受 mu 保护（M5）：io 线程写（on_open/finish_handshake）、
+    //   ticker 与应用线程读（close/is_open/messages_received）。以前只有
+    //   ticker 一侧持锁，另一侧裸读 shared_ptr → 控制块并发读写 UB。
     std::shared_ptr<netmech::Conn>         conn;
     std::shared_ptr<detail::WsSessionImpl> ws;
     Parser                                 parser{Parser::Role::client};
+
+    /// 快照访问器：不在持锁上下文里时用（回调期间绝不能持 mu，防重入死锁）。
+    std::shared_ptr<netmech::Conn> conn_snapshot()
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        return conn;
+    }
+    std::shared_ptr<detail::WsSessionImpl> ws_snapshot()
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        return ws;
+    }
 
     /// 帧层要求「这一帧写完就关传输」（close_after=true）。客户端没有服务端
     /// 那套 m_close_after_all，这里自己记一个，在 on_write 里排空待写队列后关 conn。
@@ -785,8 +823,11 @@ public:
 
     bool on_open(std::shared_ptr<netmech::Conn> c) override
     {
-        m_conn        = c;
-        m_owner->conn = c;
+        m_conn = c;
+        {
+            std::lock_guard<std::mutex> lk(m_owner->mu);
+            m_owner->conn = c;   // M5：与 ticker/应用线程的读互斥
+        }
         return send_handshake() && start_read();
     }
 
@@ -805,7 +846,7 @@ public:
         // 注意：**读循环始终在这个 ConnHandler 手里**（netmech 只认它）。
         // 握手完成后字节交给帧层，但读还得我们继续发起，否则连接就停了。
         if (!start_read()) {
-            if (!m_owner->open) {
+            if (!m_owner->open.load(std::memory_order_acquire)) {
                 m_owner->fail(make_error_code(Errc::not_connected));
             }
         }
@@ -841,10 +882,10 @@ public:
         //   于是这条路径**永远什么都不做**：is_open() 一直 true、on_message /
         //   on_close 一个都不来。订阅式客户端（client.hpp 自述的主要用途）
         //   会永久停在"假在线"，而服务端同一条路径是正常的（不对称）。
-        if (m_owner->ws) {
-            m_owner->ws->on_transport_closed();
+        if (auto ws = m_owner->ws_snapshot()) {
+            ws->on_transport_closed();
         }
-        if (!m_owner->open) {
+        if (!m_owner->open.load(std::memory_order_acquire)) {
             m_owner->fail(make_error_code(Errc::not_connected));
         }
     }
@@ -924,9 +965,9 @@ std::shared_ptr<netmech::ConnHandler> WsLinkable::on_linkup(netmech::Conn& /*c*/
 
 void WebSocketClient::Impl::on_bytes(span<const std::uint8_t> data)
 {
-    if (open) {
-        if (ws) {
-            ws->on_bytes(data);
+    if (open.load(std::memory_order_acquire)) {
+        if (auto w = ws_snapshot()) {
+            w->on_bytes(data);
         }
         return;
     }
@@ -965,7 +1006,8 @@ void WebSocketClient::Impl::finish_handshake()
 
     io.send = [weak](std::string wire, bool close_after) -> bool {
         auto o = weak.lock();
-        if (!o || !o->conn) {
+        auto c = o ? o->conn_snapshot() : nullptr;   // M5：快照读 conn
+        if (!o || !c) {
             return false;
         }
         if (close_after) {
@@ -982,12 +1024,12 @@ void WebSocketClient::Impl::finish_handshake()
         cb.owner = payload;
         cb.data  = payload->data();
         cb.size  = payload->size();
-        return o->conn->write(cb);
+        return c->write(cb);
     };
     io.close = [weak] {
         if (auto o = weak.lock()) {
-            if (o->conn) {
-                o->conn->close();
+            if (auto c = o->conn_snapshot()) {
+                c->close();
             }
         }
     };
@@ -998,12 +1040,13 @@ void WebSocketClient::Impl::finish_handshake()
     //   返回 false，而帧层的关闭流程永远不会启动（服务端有这个回调，客户端以前没有）。
     io.is_closed = [weak] {
         auto o = weak.lock();
-        return !o || !o->conn || !o->conn->is_open();
+        auto c = o ? o->conn_snapshot() : nullptr;
+        return !o || !c || !c->is_open();
     };
 
     WebSocketHandlers wrapped;
     wrapped.on_open = [this](WebSocketSession& s) {
-        open = true;
+        open.store(true, std::memory_order_release);
         if (handlers.on_open) {
             handlers.on_open(s);
         }
@@ -1014,7 +1057,7 @@ void WebSocketClient::Impl::finish_handshake()
         }
     };
     wrapped.on_close = [this](WebSocketSession& s, std::uint16_t code, std::string_view why) {
-        open = false;
+        open.store(false, std::memory_order_release);
         if (handlers.on_close) {
             handlers.on_close(s, code, why);
         }
@@ -1029,32 +1072,40 @@ void WebSocketClient::Impl::finish_handshake()
         raw_headers += "\r\n";
     }
 
-    ws = std::make_shared<detail::WsSessionImpl>(
+    auto new_ws = std::make_shared<detail::WsSessionImpl>(
         detail::WsSessionImpl::Role::client, std::move(io), cfg.ws, std::move(wrapped),
         cfg.path, std::string{}, cfg.remote, std::move(raw_headers));
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        ws = new_ws;   // M5：与应用线程的 close()/messages_received() 互斥
+    }
 
-    // 101 之后可能已经跟着帧了：解析器缓冲里的残留原样交给帧层
+    // 101 之后可能已经跟着帧了：解析器缓冲里的残留原样交给帧层。
+    // start()/on_bytes() 会回调应用（on_open 等），**不能持 mu**（防重入死锁）。
     const auto leftover = parser.pending_bytes();
-    ws->start();
+    new_ws->start();
     if (!leftover.empty()) {
-        ws->on_bytes(leftover);
+        new_ws->on_bytes(leftover);
     }
 }
 
 void WebSocketClient::Impl::fail(std::error_code ec)
 {
+    std::shared_ptr<netmech::Conn> c;
     {
         std::lock_guard<std::mutex> lk(mu);
         // 幂等：断链时 on_close 会先转 ws->on_transport_closed()，应用可能
         // 在 on_close 里再调 close()/fail()；重复进来不该重复报 on_error。
-        if (!open && !connecting) {
+        if (!open.load(std::memory_order_relaxed) &&
+            !connecting.load(std::memory_order_relaxed)) {
             return;
         }
-        open       = false;
-        connecting = false;
+        open.store(false, std::memory_order_relaxed);
+        connecting.store(false, std::memory_order_relaxed);
+        c = conn;   // 快照，关连接在锁外做（回调可能重入）
     }
-    if (conn) {
-        conn->close();
+    if (c) {
+        c->close();
     }
     if (handlers.on_error) {
         handlers.on_error(ec);
@@ -1143,24 +1194,25 @@ bool WebSocketClient::connect(WebSocketClientHandlers handlers)
 
 void WebSocketClient::close(std::uint16_t code, std::string_view reason)
 {
-    if (m_impl->ws) {
-        m_impl->ws->close(code, reason);
+    if (auto ws = m_impl->ws_snapshot()) {
+        ws->close(code, reason);
     }
 }
 
 bool WebSocketClient::connecting() const noexcept
 {
-    return m_impl->connecting;
+    return m_impl->connecting.load(std::memory_order_acquire);
 }
 
 bool WebSocketClient::is_open() const noexcept
 {
-    return m_impl->open;
+    return m_impl->open.load(std::memory_order_acquire);
 }
 
 std::uint64_t WebSocketClient::messages_received() const noexcept
 {
-    return m_impl->ws ? m_impl->ws->messages_received() : 0;
+    auto ws = m_impl->ws_snapshot();
+    return ws ? ws->messages_received() : 0;
 }
 
 } // namespace httpmech

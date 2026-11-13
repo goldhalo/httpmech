@@ -32,7 +32,9 @@ namespace httpmech {
 /// @endcode
 class HTTPMECH_API Endpoint {
 public:
-    Endpoint() noexcept = default;
+    // 不写 noexcept：std::string 成员的默认构造理论上可抛 bad_alloc，
+    // 显式 noexcept 与隐式规格不符会被 GCC 9 判为 deleted（README 承诺 GCC 9+）。
+    Endpoint() = default;
 
     /// 由 host 字面量与端口构造。不校验 host（拼接时才用得到合法性）。
     Endpoint(std::string host, std::uint16_t port) noexcept

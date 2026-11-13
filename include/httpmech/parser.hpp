@@ -115,6 +115,13 @@ public:
     /// 是否正在等"连接结束"来定界（见 `feed_eof()`）。
     [[nodiscard]] bool awaiting_eof() const noexcept;
 
+    /// 当前消息的头部是否已解析完成（不论 body 是否收齐）。
+    ///
+    /// 服务端用它切换超时判据：聚合模式下 body 还在途时，头部已收齐
+    /// 就应进入 body 阶段（body_idle_timeout），而不是继续用
+    /// header_timeout 从首字节计时误杀慢上传。
+    [[nodiscard]] bool headers_complete() const noexcept;
+
     /// 当前消息。仅当结果为 `message` / `headers` / `body_chunk` / `message_end`
     /// 时有效。
     [[nodiscard]] const HttpRequest&  request() const noexcept;

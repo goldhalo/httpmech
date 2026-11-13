@@ -245,6 +245,10 @@ struct Parser::Impl {
     /// 调用方已经喂过"连接结束"（finish_message 的条件之一）。
     bool                     eof_seen = false;
     bool                     failed   = false;
+    /// failed 时保存原始错误码：next() 每次进来会 ec.clear()，若不保存，
+    /// 服务端 feed()→pump() 两次调 next() 会把 header_too_large 等错误
+    /// 重判为 bad_request_line，状态码映射全部失真（M1 深层根因）。
+    std::error_code          failed_ec;
 
     Impl(Role r, Config c) : role(r), cfg(std::move(c))
     {
@@ -277,8 +281,9 @@ struct Parser::Impl {
 
     void fail(std::error_code& ec, Errc e)
     {
-        ec     = make_error_code(e);
-        failed = true;
+        ec        = make_error_code(e);
+        failed    = true;
+        failed_ec = ec;
     }
 
     bool parse_head(std::error_code& ec);
@@ -546,6 +551,12 @@ bool Parser::awaiting_eof() const noexcept
     return m_impl && m_impl->st == Impl::St::body_until_eof;
 }
 
+bool Parser::headers_complete() const noexcept
+{
+    // st 离开 headers 态即表示头块已解析并完成定界（不论 body 是否收齐）。
+    return m_impl && m_impl->st != Impl::St::headers;
+}
+
 Parser::Result Parser::next(std::error_code& ec)
 {
     Impl& d = *m_impl;
@@ -553,9 +564,9 @@ Parser::Result Parser::next(std::error_code& ec)
 
     for (;;) {
         if (d.failed) {
-            if (!ec) {
-                ec = make_error_code(Errc::bad_request_line);
-            }
+            // 保留原始错误码（可能是 header_too_large/body_too_large 等），
+            // 不能一律重判为 bad_request_line。
+            ec = d.failed_ec ? d.failed_ec : make_error_code(Errc::bad_request_line);
             return Result::need_more;
         }
 
@@ -787,6 +798,7 @@ void Parser::reset() noexcept
     d.header_owned.clear();
     d.last_scan = 0;
     d.failed    = false;
+    d.failed_ec.clear();
 }
 
 span<const std::uint8_t> Parser::pending_bytes() const noexcept

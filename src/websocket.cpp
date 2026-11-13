@@ -70,6 +70,49 @@ constexpr std::uint8_t kOpPong   = 0xA;
 /// close code：协议错误（RFC 6455 §7.4.1 定义的 1002）。
 constexpr std::uint16_t kCloseProtocolError = 1002;
 
+/// RFC 3629 UTF-8 合法性校验（文本帧用，M4）。
+/// 拒绝： stray continuation、overlong（C0/C1）、代理区（D800-DFFF）、
+/// >U+10FFFF、截断的多字节序列。
+bool utf8_valid(std::string_view s) noexcept
+{
+    const auto*       p = reinterpret_cast<const std::uint8_t*>(s.data());
+    const std::size_t n = s.size();
+    std::size_t       i = 0;
+    while (i < n) {
+        const std::uint8_t b0 = p[i];
+        std::size_t   extra;
+        std::uint32_t cp;
+        std::uint32_t min_cp;
+        if (b0 <= 0x7F) {
+            ++i;
+            continue;
+        } else if (b0 >= 0xC2 && b0 <= 0xDF) {
+            extra = 1; cp = b0 & 0x1Fu; min_cp = 0x80;
+        } else if (b0 >= 0xE0 && b0 <= 0xEF) {
+            extra = 2; cp = b0 & 0x0Fu; min_cp = 0x800;
+        } else if (b0 >= 0xF0 && b0 <= 0xF4) {
+            extra = 3; cp = b0 & 0x07u; min_cp = 0x10000;
+        } else {
+            return false;   // 0x80-0xBF / 0xC0-0xC1 / 0xF5+
+        }
+        if (n - i - 1 < extra) {
+            return false;   // 截断
+        }
+        for (std::size_t k = 1; k <= extra; ++k) {
+            const std::uint8_t b = p[i + k];
+            if ((b & 0xC0) != 0x80) {
+                return false;
+            }
+            cp = (cp << 6) | (b & 0x3Fu);
+        }
+        if (cp < min_cp || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+            return false;   // overlong / 代理区 / 超范围
+        }
+        i += extra + 1;
+    }
+    return true;
+}
+
 /// 追加一帧（服务端发出的帧**不打掩码**）。
 void append_frame(std::string& out, std::uint8_t opcode, bool fin,
                   const std::uint8_t* payload, std::size_t len,
@@ -254,18 +297,14 @@ void WsSessionImpl::close(std::uint16_t code, std::string_view reason)
     const std::size_t take = std::min<std::size_t>(reason.size(), 123);
     payload.append(reason.data(), take);
 
-    // 先发 close 帧，等对端回帧（tick 里超时兜底）
-    const bool sent = send_frame(
-        kOpClose, true,
-        span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(payload.data()),
-                                 payload.size()});
-    // close 帧先尝试发一次；失败可能是**正常反压**（发送队列满），也可能是
-    // 传输已经死了。前者留给 tick 重试，后者走 fail_transport —— 以前一律
-    // 当致命，反压时应用会收到一个莫名的 abnormal 关闭。
-    (void)sent;
+    // close 帧只经 try_send_close_frame 发一次（失败留 tick 在 2s 窗口重试）。
+    // 以前这里先发一帧、try_send_close_frame 又发一帧 → 双 close 帧（M2，
+    // 违反 RFC 6455 §5.5.1）。
     {
         std::lock_guard<std::mutex> lk(m_close_mu);
         m_close_payload = payload;
+        m_close_code    = code;
+        m_close_reason.assign(reason);
     }
     m_close_frame_sent.store(false, std::memory_order_release);
     m_close_deadline_ns.store(now_ns() + 2'000'000'000LL, std::memory_order_release);
@@ -304,34 +343,46 @@ void WsSessionImpl::fail_transport()
     if (m_state.exchange(State::closed, std::memory_order_acq_rel) == State::closed) {
         return;
     }
-    if (m_handlers.on_close) {
-        m_handlers.on_close(*this, static_cast<std::uint16_t>(WsCloseCode::abnormal),
-                            "transport lost");
-    }
+    notify_close("transport lost");
     if (m_io.close) {
         m_io.close();
     }
 }
 
+void WsSessionImpl::notify_close(std::string_view default_why)
+{
+    std::uint16_t code = static_cast<std::uint16_t>(WsCloseCode::abnormal);
+    std::string   why{default_why};
+    {
+        std::lock_guard<std::mutex> lk(m_close_mu);
+        if (m_close_code != 0) {
+            code = m_close_code;
+            why  = m_close_reason;
+        }
+    }
+    if (m_handlers.on_close) {
+        m_handlers.on_close(*this, code, why);
+    }
+}
+
 void WsSessionImpl::close_with_frame(std::uint16_t code, std::string_view why)
 {
-    // 「发 close 帧（写完关传输）→ 带真实 code 通知应用 → 再置 closed」。
-    // 协议错误与空闲超时共用这条收尾路径。
-    //
-    // on_transport_closed() 是正常关闭的收口（它只能报 abnormal 1006），
-    // 所以这里自己发「close 帧 + 写完后关传输」，然后直接回调并置 closed：
-    //   · close 帧用 close_after=true 交给底层，保证先写出去再关 TCP；
-    //   · 回调后再置 closed，随后的 on_transport_closed() 看到 closed 会返回，
-    //     不会第二次通知。
-    //
-    // 以前这里先置 closed 再关传输：close 帧可能没写出去，且 on_transport_closed()
-    // 以为自己来晚了 —— 所有协议错误（RSV 非 0、掩码错、未知 opcode、close code
-    // 非法、分片错乱…）一次 on_close 都不回调，应用靠它清理的状态全部残留。
-    if (m_state.load(std::memory_order_acquire) == State::closed) {
-        return;
+    // ★ 恰好一次 + io 线程回调（M3）：
+    //   · m_close_sent CAS 保证 close 帧只由一条路径发出；
+    //   · 通知不在这里回调，而是存下 code/reason，由 close_after 写完关
+    //     传输后的 on_transport_closed（io 线程）经 exchange(closed) 闸收口。
+    //   以前 load-then-store 非原子闸 + 在调用者线程（可能是 sweeper）
+    //   直接回调 → on_close 两次且线程不一致。
+    bool expected = false;
+    if (!m_close_sent.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        return;   // 别人已经在关了
     }
     m_state.store(State::closing, std::memory_order_release);
-    m_close_sent.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(m_close_mu);
+        m_close_code = code;
+        m_close_reason.assign(why);
+    }
 
     std::string payload;
     payload.push_back(static_cast<char>((code >> 8) & 0xFF));
@@ -345,15 +396,19 @@ void WsSessionImpl::close_with_frame(std::uint16_t code, std::string_view why)
                                  payload.size()},
         true /* close_after：写完 close 帧就关传输 */);
     if (!sent) {
-        // 连 close 帧都发不出去：按传输丢失收口（fail_transport 报 abnormal）。
+        // 连 close 帧都发不出去：按传输丢失收口（fail_transport 取 stored code）。
         fail_transport();
         return;
     }
+    // 发送成功：close_after 会在写完后关传输 → on_transport_closed 收口通知。
+}
 
-    m_state.store(State::closed, std::memory_order_release);
-    if (m_handlers.on_close) {
-        m_handlers.on_close(*this, code, why);
+void WsSessionImpl::on_transport_closed()
+{
+    if (m_state.exchange(State::closed, std::memory_order_acq_rel) == State::closed) {
+        return;
     }
+    notify_close("transport closed");
 }
 
 void WsSessionImpl::on_bytes(span<const std::uint8_t> data)
@@ -503,30 +558,33 @@ void WsSessionImpl::feed_one_frame(std::error_code& ec)
             why.assign(data.data() + 2, data.size() - 2);
         }
         // 回一帧 close 再断。（若我们之前已经主动发过 close，就只剩等对端这一帧。）
-        bool echoed = false;
+        // ★ 通知不在这里回调（M3）：存下 code/reason，由 on_transport_closed
+        //   经 exchange(closed) 闸收口，保证恰好一次 + io 线程。
+        const std::uint16_t report = (data.size() >= 2) ? code
+                                                        : static_cast<std::uint16_t>(WsCloseCode::no_status);
+        {
+            std::lock_guard<std::mutex> lk(m_close_mu);
+            m_close_code = report;
+            m_close_reason = why;
+        }
         bool expected_unused = false;
         if (m_close_sent.compare_exchange_strong(expected_unused, true,
                                                 std::memory_order_acq_rel)) {
             std::string echo;
             echo.push_back(data.size() >= 2 ? data[0] : static_cast<char>(0x03));
             echo.push_back(data.size() >= 2 ? data[1] : static_cast<char>(0xE8));   // 1000
-            send_frame(kOpClose, true,
-                       span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(echo.data()),
-                                                echo.size()},
-                       true /* close_after */);
-            echoed = true;
+            if (!send_frame(kOpClose, true,
+                            span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(echo.data()),
+                                                     echo.size()},
+                            true /* close_after */)) {
+                fail_transport();   // echo 发不出去：按传输丢失收口
+            }
+            // 发送成功：close_after 写完关传输 → on_transport_closed 收口通知。
+            return;
         }
-        const std::uint16_t report = (data.size() >= 2) ? code
-                                                        : static_cast<std::uint16_t>(WsCloseCode::no_status);
-        if (m_handlers.on_close) {
-            m_handlers.on_close(*this, report, why);
-        }
-        m_state.store(State::closed, std::memory_order_release);
-        // 刚回过 close 的情况：那一帧是 close_after=true 排进队列的，
-        // **不能**再调 io.close() —— 会把还没写出去的 close 帧一起丢掉，
-        // 对端只能看到 TCP 被掐断（RFC 6455 里这叫 abnormal closure）。
-        // 反之（我们早就发过 close，这次只是收到对端的回应）才需要收尾。
-        if (!echoed && m_io.close) {
+        // 我们早就发过 close，这次只是收到对端的回应：关传输，
+        // 通知交给 on_transport_closed（io 线程、恰好一次）。
+        if (m_io.close) {
             m_io.close();
         }
         return;
@@ -581,6 +639,13 @@ void WsSessionImpl::feed_one_frame(std::error_code& ec)
 
 void WsSessionImpl::deliver_message(std::string&& payload, bool is_text)
 {
+    // RFC 6455 §5.6：文本帧必须是合法 UTF-8。validate_utf8 以前是死配置
+    // （声明了但从不读取），现在落实（M4）：非法 → 1007 协议错误。
+    if (is_text && m_cfg.validate_utf8 && !utf8_valid(payload)) {
+        protocol_error(static_cast<std::uint16_t>(WsCloseCode::invalid_payload),
+                       "invalid UTF-8");
+        return;
+    }
     m_recv_msgs.fetch_add(1, std::memory_order_relaxed);
     if (!m_handlers.on_message) {
         return;
@@ -654,16 +719,6 @@ void WsSessionImpl::tick(std::chrono::steady_clock::time_point now)
         now_ns_v - m_last_ping_ns.load(std::memory_order_relaxed) >= ping_ns) {
         m_last_ping_ns.store(now_ns_v, std::memory_order_relaxed);
         send_frame(kOpPing, true, {});
-    }
-}
-
-void WsSessionImpl::on_transport_closed()
-{
-    if (m_state.exchange(State::closed, std::memory_order_acq_rel) == State::closed) {
-        return;
-    }
-    if (m_handlers.on_close) {
-        m_handlers.on_close(*this, static_cast<std::uint16_t>(WsCloseCode::abnormal), "transport closed");
     }
 }
 

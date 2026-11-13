@@ -98,9 +98,13 @@ private:
     /// 传输层已经不可用：通知应用一次 on_close，然后关干净。
     void        fail_transport();
 
-    /// 发 close 帧（写完关传输）+ 带真实 code 通知应用，恰好一次。
-    /// 协议错误与空闲超时共用；返回后状态为 closed。
+    /// 发 close 帧（写完关传输），通知由 on_transport_closed 收口。
+    /// 协议错误与空闲超时共用；恰好一次 + io 线程回调（M3）。
     void        close_with_frame(std::uint16_t code, std::string_view why);
+
+    /// 唯一的 on_close 通知点：取 m_close_mu 保护的 code/reason（没有则 abnormal）。
+    /// 调用前必须已经通过 exchange(closed) 闸。
+    void        notify_close(std::string_view default_why);
 
     /// 尝试把 close 帧发出去；失败时区分「反压（留 tick 重试）」与「传输已死」。
     bool        try_send_close_frame();
@@ -129,6 +133,10 @@ private:
     /// close 帧载荷（close() 写入、tick 重试读取），受 m_close_mu 保护。
     std::mutex           m_close_mu;
     std::string          m_close_payload;
+    /// 关闭通知用的 code/reason（受 m_close_mu 保护）。0 = 未指定→abnormal。
+    /// 各关闭路径先存这里，由 notify_close 统一取出，保证恰好一次。
+    std::uint16_t        m_close_code = 0;
+    std::string          m_close_reason;
     /// 原子：io 线程自增，应用可能在别的线程读（`messages_received()`）。
     std::atomic<std::uint64_t> m_recv_msgs{0};
 

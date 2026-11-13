@@ -187,7 +187,14 @@ public:
             return;
         }
         if (ec) {
-            close_now();
+            // 对端半关（FIN）但本端还有在途响应写：让它写完再关，
+            // 别掐断 keep-alive 响应（netmech close 中止在途写而非冲刷）。
+            // 真错误也会在 on_write 的 ec 里归还，届时再关（m2）。
+            if (m_inflight.load(std::memory_order_acquire) > 0) {
+                m_close_after_all.store(true, std::memory_order_release);
+            } else {
+                close_now();
+            }
             return;
         }
         const std::int64_t now_ns = now_ns_v();
@@ -626,6 +633,12 @@ void ServerSession::pump()
 
         switch (r) {
         case httpmech::Parser::Result::need_more:
+            // 聚合模式：头部已收齐但 body 还在途时，也要切到 body 阶段
+            // 判据（body_idle_timeout），否则慢上传会被 header_timeout
+            // 从首字节计时误杀（M7）。
+            if (m_parser.headers_complete()) {
+                m_req_headers_done.store(true, std::memory_order_release);
+            }
             return;   // 等下一批数据
 
         case httpmech::Parser::Result::message:
@@ -700,6 +713,7 @@ void ServerSession::dispatch_stream_events(span<const std::uint8_t> body, bool i
             // 应用拒收：直接回 413 并关连接（省带宽）
             m_writer.code   = static_cast<std::uint16_t>(Status::payload_too_large);
             m_writer.reason = reason_phrase(Status::payload_too_large);
+            m_writer.ended  = true;   // 库主动完成的完整响应，勿走 500 兜底
             finish_writer(false);
             return;
         }
@@ -736,6 +750,10 @@ void ServerSession::respond_protocol_error(Status code)
     m_writer.code   = static_cast<std::uint16_t>(code);
     m_writer.reason = reason_phrase(code);
     m_writer.headers.set("Content-Length", "0");
+    // ★ 协议错误是库主动完成的完整响应，标记 ended 以区别于"应用忘调
+    //   end()"——否则 finish_writer 的 !ended→500 兜底会把映射好的
+    //   400/431/413/501 全覆盖成 500（M1）。
+    m_writer.ended  = true;
     finish_writer(false);
 }
 
@@ -857,7 +875,13 @@ void ServerSession::finish_stream_response()
     if (!app_connection.empty() && token_list_contains(app_connection, "close")) {
         ka = false;
     }
-    send(std::string("0\r\n\r\n"), !ka);
+    if (!send(std::string("0\r\n\r\n"), !ka)) {
+        // 终止块发不出去（反压/对端已断）：与 start_stream_response /
+        // send_stream_chunk 对称，abort + 关连接。否则 keep-alive 复用
+        // 时下一条响应会接在未终止的 chunked 流后→协议损坏（m1）。
+        m_writer.aborted = true;
+        close_now();
+    }
 }
 
 /// keep-alive 收尾：解析器与 writer 复位（HTTP/1.0 或 close 时只清状态）。
@@ -1282,6 +1306,9 @@ void ResponseWriter::set_status(Status s, std::string_view reason)
 
 void ResponseWriter::set_status(std::uint16_t code, std::string_view reason)
 {
+    if (m_impl->sent) {
+        return;   // 头已发出：修改对线路无影响，与 headers_sent() 文档对齐（m3）
+    }
     m_impl->status = status_from(code);
     m_impl->code   = code;
 
@@ -1297,6 +1324,9 @@ void ResponseWriter::set_status(std::uint16_t code, std::string_view reason)
 
 void ResponseWriter::set_header(std::string_view name, std::string_view value)
 {
+    if (m_impl->sent) {
+        return;   // 头已发出（m3）
+    }
     // 头名必须是 token（不含 CR/LF/冒号），值里不能有 CR/LF —— 否则应用
     // 拼进来的脏数据会变成第二条响应。解析侧已经这么严了，生成侧对称处理。
     if (name.empty() || name.find_first_of("\r\n:") != std::string_view::npos) {
@@ -1310,6 +1340,9 @@ void ResponseWriter::set_header(std::string_view name, std::string_view value)
 
 void ResponseWriter::add_header(std::string_view name, std::string_view value)
 {
+    if (m_impl->sent) {
+        return;   // 头已发出（m3）
+    }
     if (name.empty() || name.find_first_of("\r\n:") != std::string_view::npos) {
         return;
     }
