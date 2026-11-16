@@ -28,6 +28,7 @@
 #include <netmech/mechanism.hpp>
 #include <netmech/iohandler.hpp>
 #include <netmech/linkable.hpp>
+#include <netmech/tls.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -756,6 +757,9 @@ void ServerSession::dispatch_aggregate()
 
     // 代理头识别：只有对端在 trusted_proxies 里，X-Real-IP 一类才被采信
     req.from_trusted_proxy = is_trusted_proxy(m_peer, m_owner->cfg.trusted_proxies);
+
+    // v0.91：连接本身是 TLS 时记下来（`is_secure()` = 这个 || 代理头声明 https）。
+    req.is_secure_connection = (m_conn != nullptr) && m_conn->is_secure();
 
     m_writer.reset_for_request(req.method == Method::head);
     m_writer.request = &req;
@@ -1518,8 +1522,24 @@ std::error_code HttpServer::start()
     auto bridge     = std::make_shared<detail::AcceptBridge>(m_impl);
     m_impl->bridge  = bridge;
 
-    const auto ec = m_impl->mech->listen(detail::to_address(m_impl->cfg.local), bridge,
-                                         m_impl->cfg.backlog);
+    // TLS（v0.91）：有配置就走带选项的重载，否则保持老的明文路径。
+    //
+    // ★ ALPN 强制成 `{"http/1.1"}`：本库只讲 h1.1。若放任使用者配 `{"h2",...}`，
+    //   客户端很可能协商出 h2 然后把二进制帧喂给 h1 解析器 —— 表现为"服务端
+    //   收到一堆协议错误"，排查成本极高。要 h2 请用 h2mech。
+    netmech::ListenOptions listen_opts;
+    listen_opts.backlog = m_impl->cfg.backlog;
+    if (m_impl->cfg.tls) {
+        netmech::TlsConfig tls = *m_impl->cfg.tls;      // 拷一份再改，不动调用方的对象
+        tls.alpn               = {"http/1.1"};
+        listen_opts.tls        = std::move(tls);
+    }
+
+    const auto ec = m_impl->cfg.tls
+                        ? m_impl->mech->listen(detail::to_address(m_impl->cfg.local), bridge,
+                                               listen_opts)
+                        : m_impl->mech->listen(detail::to_address(m_impl->cfg.local), bridge,
+                                               m_impl->cfg.backlog);
     if (ec) {
         m_impl->bridge.reset();
         m_impl->running.store(false);

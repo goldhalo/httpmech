@@ -43,8 +43,9 @@
 #include <httpmech/websocket.hpp>
 
 namespace netmech {
-class Mechanism;   // 前向声明：仅 create_with_mechanism() 用到，不需要它的头
-class Runtime;     // 前向声明：ServerConfig::runtime
+class Mechanism;      // 前向声明：仅 create_with_mechanism() 用到，不需要它的头
+class Runtime;        // 前向声明：ServerConfig::runtime
+struct TlsConfig;     // 前向声明：ServerConfig::tls（构造它需 <netmech/tls.hpp>）
 } // namespace netmech
 
 namespace httpmech {
@@ -322,6 +323,27 @@ struct ServerConfig {
     /// @note **追加在结构体末尾**：`ServerConfig` 是安装出去的公开结构体，
     ///       这属于 ABI 变更，SHARED 构建的使用方需重新编译。
     std::size_t max_send_queue_bytes = 2 * 1024 * 1024;
+
+    /// 非空 ⇒ 本 server 只接受 **TLS** 连接（进程内终结，v0.91）。
+    ///
+    /// @par 怎么构造
+    /// @code
+    ///   #include <netmech/tls.hpp>          // 本头只前向声明，构造时要引这个
+    ///   auto tls = std::make_shared<netmech::TlsConfig>();
+    ///   tls->cert_chain_file  = "server.crt";
+    ///   tls->private_key_file = "server.key";
+    ///   cfg.tls = tls;
+    /// @endcode
+    ///
+    /// @note 用 `shared_ptr<const T>` 而不是 `optional<T>`：这样公共头不必
+    ///       include netmech（同 `runtime` 的做法），没装 netmech 头的使用者
+    ///       也不受影响。
+    /// @note **ALPN 由本库强制设为 `{"http/1.1"}`**：httpmech 只讲 HTTP/1.1，
+    ///       若协商出 `h2`，后续字节流会被 h1 解析器当成垃圾 —— 与其让使用者
+    ///       配错，不如直接覆盖（TLS 之外的能力请交给 h2mech）。
+    /// @note 明文与 TLS **不能**在同一个 `HttpServer` 上共存；需要两者并存时
+    ///       起两个 server（`local` 用不同端口，或一个 80 一个 443）。
+    std::shared_ptr<const netmech::TlsConfig> tls;
 };
 
 /// HTTP/1.1 服务端。

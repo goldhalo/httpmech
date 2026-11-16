@@ -8,11 +8,21 @@
 // 只有 linger_zero 那个用例需要直接构造 netmech 的 Mechanism
 #include <netmech/mechanism.hpp>
 
+#include <netmech/tls.hpp>
+
+// HTTPS 用例在运行时生成自签证书（仅 NETMECH_TLS=ON 的构建）。
+#if defined(NETMECH_HAS_TLS)
+#    include <openssl/evp.h>
+#    include <openssl/pem.h>
+#    include <openssl/x509.h>
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <atomic>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -845,6 +855,253 @@ void test_http_client_e2e()
     cli->close();
     srv->stop();
 }
+
+// -----------------------------------------------------------------------------
+//  HTTPS / wss（v0.91，仅 NETMECH_TLS=ON 的构建）
+//
+//  证书在运行时用 OpenSSL C API 生成（EC P-256 自签），不往仓库塞 PEM。
+// -----------------------------------------------------------------------------
+#if defined(NETMECH_HAS_TLS)
+
+namespace {
+
+struct TestCert {
+    std::string cert_path;
+    std::string key_path;
+    std::string fingerprint;   ///< 小写 hex，无分隔符
+    bool        ok = false;
+
+    TestCert() = default;
+    TestCert(const TestCert&) = delete;
+    TestCert& operator=(const TestCert&) = delete;
+    ~TestCert()
+    {
+        if (!cert_path.empty()) std::remove(cert_path.c_str());
+        if (!key_path.empty()) std::remove(key_path.c_str());
+    }
+
+    std::string wrong_fingerprint() const
+    {
+        std::string bad = fingerprint;
+        if (!bad.empty()) bad.back() = (bad.back() == 'f') ? '0' : 'f';
+        return bad;
+    }
+};
+
+std::string temp_path(const char* suffix)
+{
+    static std::atomic<unsigned> seq{0};
+    const auto dir  = std::filesystem::temp_directory_path();
+    const auto name = std::string("httpmech_tls_") + std::to_string(seq.fetch_add(1)) + suffix;
+    return (dir / name).string();
+}
+
+/// 生成自签证书（EC P-256）。写 PEM 一律用 BIO_*：Windows 上把 FILE* 交给
+/// 独立 DLL 的 OpenSSL 会 abort（OPENSSL_Uplink: no OPENSSL_Applink）。
+TestCert make_self_signed()
+{
+    TestCert out;
+
+    EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
+    if (pctx == nullptr) return out;
+    EVP_PKEY* pkey = nullptr;
+    bool ok = (EVP_PKEY_keygen_init(pctx) == 1);
+    ok = ok && (EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, NID_X9_62_prime256v1) == 1);
+    ok = ok && (EVP_PKEY_keygen(pctx, &pkey) == 1);
+    EVP_PKEY_CTX_free(pctx);
+    if (!ok || pkey == nullptr) {
+        if (pkey != nullptr) EVP_PKEY_free(pkey);
+        return out;
+    }
+
+    X509* x = X509_new();
+    if (x == nullptr) {
+        EVP_PKEY_free(pkey);
+        return out;
+    }
+
+    bool cert_ok = (X509_set_version(x, 2) == 1);
+    if (cert_ok) {
+        ASN1_INTEGER* serial = ASN1_INTEGER_new();
+        cert_ok = (serial != nullptr) && (ASN1_INTEGER_set(serial, 1) == 1)
+                  && (X509_set_serialNumber(x, serial) == 1);
+        if (serial != nullptr) ASN1_INTEGER_free(serial);
+    }
+    if (cert_ok) {
+        ASN1_TIME* nb = ASN1_TIME_new();
+        ASN1_TIME* na = ASN1_TIME_new();
+        const std::time_t now = std::time(nullptr);
+        cert_ok = (nb != nullptr) && (na != nullptr)
+                  && (ASN1_TIME_set(nb, now - 60) != nullptr)
+                  && (ASN1_TIME_set(na, now + 3600) != nullptr)
+                  && (X509_set1_notBefore(x, nb) == 1)
+                  && (X509_set1_notAfter(x, na) == 1);
+        if (nb != nullptr) ASN1_TIME_free(nb);
+        if (na != nullptr) ASN1_TIME_free(na);
+    }
+    if (cert_ok) {
+        X509_NAME* name = X509_NAME_new();
+        cert_ok = (name != nullptr)
+                  && (X509_NAME_add_entry_by_txt(
+                          name, "CN", MBSTRING_ASC,
+                          reinterpret_cast<const unsigned char*>("httpmech-test"),
+                          -1, -1, 0) == 1)
+                  && (X509_set_subject_name(x, name) == 1)
+                  && (X509_set_issuer_name(x, name) == 1);
+        if (name != nullptr) X509_NAME_free(name);
+    }
+    cert_ok = cert_ok && (X509_set_pubkey(x, pkey) == 1);
+    cert_ok = cert_ok && (X509_sign(x, pkey, EVP_sha256()) > 0);
+
+    if (cert_ok) {
+        unsigned char digest[EVP_MAX_MD_SIZE];
+        unsigned int  len = 0;
+        cert_ok = (X509_digest(x, EVP_sha256(), digest, &len) == 1);
+        if (cert_ok) {
+            static const char kHex[] = "0123456789abcdef";
+            out.fingerprint.reserve(static_cast<std::size_t>(len) * 2);
+            for (unsigned int i = 0; i < len; ++i) {
+                out.fingerprint.push_back(kHex[(digest[i] >> 4) & 0x0F]);
+                out.fingerprint.push_back(kHex[digest[i] & 0x0F]);
+            }
+        }
+    }
+
+    if (cert_ok) {
+        out.cert_path = temp_path(".crt.pem");
+        out.key_path  = temp_path(".key.pem");
+
+        BIO* bc = BIO_new_file(out.cert_path.c_str(), "wb");
+        cert_ok = (bc != nullptr);
+        if (bc != nullptr) {
+            cert_ok = (PEM_write_bio_X509(bc, x) == 1);
+            BIO_free(bc);
+        }
+        BIO* bk = BIO_new_file(out.key_path.c_str(), "wb");
+        if (bk == nullptr) {
+            cert_ok = false;
+        } else {
+            cert_ok = cert_ok
+                      && (PEM_write_bio_PrivateKey(bk, pkey, nullptr, nullptr, 0, nullptr,
+                                                   nullptr) == 1);
+            BIO_free(bk);
+        }
+    }
+
+    X509_free(x);
+    EVP_PKEY_free(pkey);
+    out.ok = cert_ok;
+    return out;
+}
+
+} // namespace
+
+void test_https_e2e()
+{
+    g_case = "https e2e";
+
+    TestCert cert = make_self_signed();
+    REQUIRE(cert.ok);
+
+    auto srv_tls = std::make_shared<netmech::TlsConfig>();
+    srv_tls->cert_chain_file  = cert.cert_path;
+    srv_tls->private_key_file = cert.key_path;
+
+    httpmech::ServerConfig cfg;
+    cfg.local     = {"127.0.0.1", 0};
+    cfg.emit_date = false;
+    cfg.tls       = srv_tls;
+
+    // 服务端把 is_secure() 记下来：这条断言才是"进程内 TLS 真的生效"的证据。
+    auto saw_secure = std::make_shared<std::atomic<bool>>(false);
+    auto router     = std::make_shared<httpmech::Router>();
+    router->post("/api/echo", [saw_secure](const httpmech::HttpRequest& req,
+                                           httpmech::ResponseWriter& out) {
+        saw_secure->store(req.is_secure());
+        out.write(req.body);
+        out.end();
+    });
+
+    auto srv = httpmech::HttpServer::create(cfg, router);
+    REQUIRE(srv != nullptr);
+    REQUIRE(!srv->start());
+
+    // --- 正确指纹：必须成功，且服务端看到 is_secure() == true ---
+    {
+        auto cli_tls            = std::make_shared<netmech::TlsConfig>();
+        cli_tls->pinned_sha256  = cert.fingerprint;
+        cli_tls->server_name    = "httpmech-test";
+
+        httpmech::ClientConfig ccfg;
+        ccfg.remote = {"127.0.0.1", srv->local().port()};
+        ccfg.tls    = cli_tls;
+
+        auto cli = httpmech::HttpClient::create(ccfg);
+        REQUIRE(cli != nullptr);
+
+        auto w = std::make_shared<Waiter>();
+        auto h = std::make_shared<SyncHandler>(w);
+        httpmech::RequestSpec spec;
+        spec.method = httpmech::Method::post;
+        spec.target = "/api/echo";
+        spec.body   = "hello-https";
+        REQUIRE(cli->request(std::move(spec), h));
+        CHECK(w->wait());
+        CHECK(!h->ec);
+        CHECK_EQ(static_cast<int>(h->status), 200);
+        CHECK_EQ(h->body, std::string{"hello-https"});
+        CHECK(saw_secure->load());
+        CHECK_EQ(cli->failures_total(), std::uint64_t{0});
+        cli->close();
+    }
+
+    // --- 指纹不对：握手必须失败（HTTP 层拿不到响应） ---
+    {
+        auto bad_tls           = std::make_shared<netmech::TlsConfig>();
+        bad_tls->pinned_sha256 = cert.wrong_fingerprint();
+
+        httpmech::ClientConfig ccfg;
+        ccfg.remote = {"127.0.0.1", srv->local().port()};
+        ccfg.tls    = bad_tls;
+
+        auto cli = httpmech::HttpClient::create(ccfg);
+        REQUIRE(cli != nullptr);
+
+        auto w = std::make_shared<Waiter>();
+        auto h = std::make_shared<SyncHandler>(w);
+        httpmech::RequestSpec spec;
+        spec.target = "/api/echo";
+        REQUIRE(cli->request(std::move(spec), h));
+        CHECK(w->wait());
+        CHECK(static_cast<bool>(h->ec));
+        cli->close();
+    }
+
+    srv->stop();
+}
+
+#else  // NETMECH_HAS_TLS
+
+void test_https_e2e()
+{
+    g_case = "https e2e";
+    // 本构建没编 TLS：只验证"配了 tls 会在受理阶段被明确拒绝"这一条语义。
+    auto tls = std::make_shared<netmech::TlsConfig>();
+    tls->cert_chain_file  = "nope.crt";
+    tls->private_key_file = "nope.key";
+
+    httpmech::ServerConfig cfg;
+    cfg.local = {"127.0.0.1", 0};
+    cfg.tls   = tls;
+
+    auto router = std::make_shared<httpmech::Router>();
+    auto srv    = httpmech::HttpServer::create(cfg, router);
+    REQUIRE(srv != nullptr);
+    const std::error_code ec = srv->start();
+    CHECK(static_cast<bool>(ec));   // 未编 TLS → tls_unsupported
+}
+
+#endif // NETMECH_HAS_TLS
 
 // -----------------------------------------------------------------------------
 //  chunked 响应：用一个"假服务端"直接往 socket 里写手写报文。
@@ -2420,6 +2677,7 @@ int main()
         {"ws idle timeout",     test_websocket_idle_timeout_calls_on_close},
         {"ws protocol error on_close", test_websocket_protocol_error_closes_once},
         {"http client e2e",     test_http_client_e2e},
+        {"https e2e",           test_https_e2e},
         {"runtime injection",   test_runtime_injection},
         {"http client chunked", test_http_client_chunked},
         {"websocket client e2e", test_websocket_client_e2e},

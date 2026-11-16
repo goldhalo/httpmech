@@ -22,7 +22,7 @@
 //    · 不自动跟随重定向（3xx 原样交给应用，`Location` 已给）
 //    · 不做 POST 的 multipart 编码、不做 gzip 解码（`Accept-Encoding` 别自己填）
 //    · 不做 cookie 罐
-//    · 不做 HTTPS（TLS 需要 OpenSSL，见 docs/design.md「未实现项」）
+//    · v0.91 起**支持 HTTPS / wss**（进程内 TLS，见 ClientConfig::tls）
 // =============================================================================
 #pragma once
 
@@ -44,8 +44,9 @@
 #include <httpmech/websocket.hpp>
 
 namespace netmech {
-class Mechanism;   // 前向声明（仅 create_with_mechanism 用）
-class Runtime;     // 前向声明（ClientConfig / WebSocketClientConfig::runtime）
+class Mechanism;    // 前向声明（仅 create_with_mechanism 用）
+class Runtime;      // 前向声明（ClientConfig / WebSocketClientConfig::runtime）
+struct TlsConfig;   // 前向声明（ClientConfig / WebSocketClientConfig::tls）
 } // namespace netmech
 
 namespace httpmech {
@@ -131,6 +132,23 @@ struct ClientConfig {
 
     /// 单次连接最多发多少个请求后主动断开（防止对端会话老化后突然 RST）。
     std::size_t max_requests_per_connection = 100;
+
+    /// 非空 ⇒ 走 **HTTPS**（进程内 TLS，v0.91）。
+    ///
+    /// @par 怎么构造
+    /// @code
+    ///   #include <netmech/tls.hpp>
+    ///   auto tls = std::make_shared<netmech::TlsConfig>();
+    ///   tls->pinned_sha256 = "AB:CD:...";     // 自签设备用指纹 pin
+    ///   cfg.tls = tls;
+    /// @endcode
+    ///
+    /// @note ALPN 由本库强制成 `{"http/1.1"}`（本库只讲 h1.1）。
+    /// @note 客户端必须给 `pinned_sha256` 或 `verify_certificate = true`，
+    ///       否则 `netmech::connect()` 直接返回 `invalid_argument`（见 tls.hpp）。
+    /// @note 连接失败（含 TLS 握手失败/证书被拒）走原有的失败回调，
+    ///       错误码可用 `netmech::from_boost_error_code()` 归类。
+    std::shared_ptr<const netmech::TlsConfig> tls;
 };
 
 /// HTTP/1.1 客户端（单连接 + 串行队列）。
@@ -221,6 +239,10 @@ struct WebSocketClientConfig {
     std::chrono::milliseconds handshake_timeout{5'000};
 
     WebSocketConfig ws{};
+
+    /// 非空 ⇒ 走 **wss://**（TLS 上的 WebSocket，v0.91）。
+    /// 语义与 `ClientConfig::tls` 相同（ALPN 同样是 `http/1.1`）。
+    std::shared_ptr<const netmech::TlsConfig> tls;
 };
 
 /// 客户端侧的回调。

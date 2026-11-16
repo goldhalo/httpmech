@@ -140,6 +140,12 @@ struct HTTPMECH_API HttpRequest {
     /// 库在派发前填好）。**为 false 时，下面三个字段一律不采信**。
     bool from_trusted_proxy = false;
 
+    /// 承载本请求的连接**本身**是否是 TLS（进程内终结，v0.91）。
+    ///
+    /// 由库在派发前按 `netmech::Conn::is_secure()` 填好。与
+    /// `is_forwarded_https()` 的区别：那个看的是代理头，这个看的是真实连接。
+    bool is_secure_connection = false;
+
     /// 客户端真实 IP。
     ///
     /// 优先级：`X-Real-IP` → `X-Forwarded-For` 的第一个地址 → 空。
@@ -149,13 +155,25 @@ struct HTTPMECH_API HttpRequest {
     /// 客户端真实端口（`X-Real-PORT`）。缺失返回 0。
     [[nodiscard]] std::uint16_t real_port() const noexcept;
 
-    /// 原始连接是否为 HTTPS。
+    /// 原始连接是否为 HTTPS（**只看代理头**）。
     ///
     /// 判断依据（nginx 终结 TLS 时的通行做法）：
     ///   · `X-Forwarded-Proto: https`
     ///   · `X-AGENT-SSL: 非 0`（现场已有的约定）
-    /// 本端直连且不是 TLS 时恒为 false。
+    /// 只有 `from_trusted_proxy` 为 true 才采信，否则恒为 false。
+    ///
+    /// @note 进程内 TLS 终结（`ServerConfig::tls`）**不**走这里 —— 那种情况下
+    ///       连接本身就是加密的，应当用 `is_secure()`（它是两者的并集），
+    ///       或者直接看 `is_secure_connection`。
     [[nodiscard]] bool is_forwarded_https() const noexcept;
+
+    /// 本请求是否"跑在 HTTPS 上"：**真实 TLS 连接** 或 **受信任代理转发来的 https**。
+    ///
+    /// 业务判断"要不要跳转 https / 能不能发 secure cookie"用这个就够了。
+    [[nodiscard]] bool is_secure() const noexcept
+    {
+        return is_secure_connection || is_forwarded_https();
+    }
 };
 
 // =============================================================================

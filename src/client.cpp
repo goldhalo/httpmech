@@ -24,6 +24,7 @@
 #include <netmech/iohandler.hpp>
 #include <netmech/linkable.hpp>
 #include <netmech/mechanism.hpp>
+#include <netmech/tls.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -558,8 +559,22 @@ void HttpClient::Impl::do_connect()
         std::lock_guard<std::mutex> lk(mu);
         linkable = lb;                 // 保活：否则 connect 一返回就失效
     }
-    const auto ec = mech->connect(
-        detail::to_address(cfg.remote), lb, static_cast<std::uint32_t>(cfg.connect_timeout.count()));
+    // v0.91：配了 tls 就走带选项的重载（HTTPS）；否则保持原来的明文路径。
+    //
+    // ALPN 强制成 `{"http/1.1"}`：本库只讲 h1.1，协商出别的协议只会把
+    // 对端的二进制帧喂给 h1 解析器。
+    std::error_code ec;
+    if (cfg.tls) {
+        netmech::TlsConfig tls = *cfg.tls;
+        tls.alpn                = {"http/1.1"};
+        netmech::ConnectOptions copts;
+        copts.timeout_ms = static_cast<std::uint32_t>(cfg.connect_timeout.count());
+        copts.tls        = std::move(tls);
+        ec = mech->connect(detail::to_address(cfg.remote), lb, copts);
+    } else {
+        ec = mech->connect(detail::to_address(cfg.remote), lb,
+                           static_cast<std::uint32_t>(cfg.connect_timeout.count()));
+    }
     if (ec) {
         {
             std::lock_guard<std::mutex> lk(mu);
@@ -1176,9 +1191,20 @@ bool WebSocketClient::connect(WebSocketClientHandlers handlers)
         m_impl->linkable = lb;   // 保活
     }
 
-    const auto ec = m_impl->mech->connect(
-        detail::to_address(m_impl->cfg.remote), lb,
-        static_cast<std::uint32_t>(m_impl->cfg.connect_timeout.count()));
+    // v0.91：wss（TLS 上的 WebSocket）；ALPN 同 HttpClient。
+    std::error_code ec;
+    if (m_impl->cfg.tls) {
+        netmech::TlsConfig tls = *m_impl->cfg.tls;
+        tls.alpn                     = {"http/1.1"};
+        netmech::ConnectOptions copts;
+        copts.timeout_ms = static_cast<std::uint32_t>(m_impl->cfg.connect_timeout.count());
+        copts.tls        = std::move(tls);
+        ec = m_impl->mech->connect(detail::to_address(m_impl->cfg.remote), lb, copts);
+    } else {
+        ec = m_impl->mech->connect(
+            detail::to_address(m_impl->cfg.remote), lb,
+            static_cast<std::uint32_t>(m_impl->cfg.connect_timeout.count()));
+    }
     if (ec) {
         {
             std::lock_guard<std::mutex> lk(m_impl->mu);

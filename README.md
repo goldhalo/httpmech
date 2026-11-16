@@ -3,13 +3,15 @@
 [![CI](https://github.com/goldhalo/httpmech/actions/workflows/ci.yml/badge.svg)](https://github.com/goldhalo/httpmech/actions/workflows/ci.yml)
 
 **HTTP/1.1 与 WebSocket 的服务端协议层**，基于 [netmech](../netmech) 的 TCP。
-TLS、HTTP/2 交给前面的 nginx，本库只处理它转过来的明文请求。
+**v0.91 起支持进程内 TLS**（HTTPS / WSS，`ServerConfig::tls` / `ClientConfig::tls`，
+ALPN 固定 `http/1.1`）；不想自己管证书时也仍然可以由 nginx 终结。
+HTTP/2 / gRPC **不在本库**（单独的 h2mech）。
 静态文件由可选的 `StaticFileHandler` 组件提供（分块投递、背压、任意大小文件，
 见「静态文件服务」一节）；超高并发静态服务仍建议交给 nginx。
 
 ```
-浏览器 ──HTTPS/WSS──► nginx ──HTTP/1.1 明文──► httpmech ──► netmech ──► TCP
-                       (TLS 终结)                (本库)
+方式 A（进程内终结）: 浏览器 ──HTTPS/WSS──► httpmech ──► netmech(TLS) ──► TCP
+方式 B（nginx 前置）: 浏览器 ──HTTPS/WSS──► nginx ──明文──► httpmech ──► netmech ──► TCP
 ```
 
 - **公共头不依赖 netmech**：只用 httpmech 时不需要把 netmech 的头挂到 include 路径上
@@ -24,7 +26,8 @@ TLS、HTTP/2 交给前面的 nginx，本库只处理它转过来的明文请求�
 
 | 做 | 不做 |
 |---|---|
-| HTTP/1.1 解析与序列化、chunked 请求体 | TLS / HTTPS（nginx 终结） |
+| HTTP/1.1 解析与序列化、chunked 请求体 | HTTP/2、gRPC（交给 h2mech） |
+| **HTTPS / WSS（进程内 TLS，v0.91，需 netmech 编 `NETMECH_TLS=ON`）** | TLS 1.0/1.1、客户端证书链吊销（CRL/OCSP） |
 | 路由（精确匹配）+ before/after 钩子 | HTTP/2、gRPC |
 | WebSocket（握手、帧层、分片、ping/pong、close） | 业务纤程 / 线程池 |
 | keep-alive、流式 body、资源上限 | 连接池 / 自动重连 / 重定向跟随 |
@@ -33,6 +36,37 @@ TLS、HTTP/2 交给前面的 nginx，本库只处理它转过来的明文请求�
 | **客户端**：HttpClient（串行队列）/ WebSocketClient | 连接池、自动重连、cookie 罐 |
 
 设计取舍见 **[docs/design.md](docs/design.md)**（含与 wtoe::HttpProtocol 的对照）。
+
+---
+
+## HTTPS / WSS（v0.91）
+
+netmech 编了 `-DNETMECH_TLS=ON` 时，httpmech 可以直接终结 TLS：
+
+```cpp
+#include <netmech/tls.hpp>
+
+// 服务端
+auto tls = std::make_shared<netmech::TlsConfig>();
+tls->cert_chain_file  = "server.crt";
+tls->private_key_file = "server.key";
+httpmech::ServerConfig cfg;
+cfg.local = {"0.0.0.0", 443};
+cfg.tls   = tls;                       // ← 只加这一行
+// ALPN 由本库固定成 {"http/1.1"}（本库不讲 h2）
+
+// 客户端（自签设备用指纹 pin）
+auto cli_tls = std::make_shared<netmech::TlsConfig>();
+cli_tls->pinned_sha256 = "AB:CD:...";  // openssl x509 -fingerprint -sha256
+httpmech::ClientConfig ccfg;
+ccfg.remote = {"10.0.0.5", 443};
+ccfg.tls    = cli_tls;
+
+// WebSocket 同理：WebSocketClientConfig::tls → wss://
+```
+
+业务侧判断"这条请求是不是 HTTPS"用 `req.is_secure()`（`is_secure_connection`
+或受信任代理的 `X-Forwarded-Proto` / `X-AGENT-SSL`，两者取并集）。
 
 ---
 
