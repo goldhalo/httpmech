@@ -76,6 +76,67 @@ jobs:
         run: ./build/bin/httpmech_ut || true
 
   # ---------------------------------------------------------------------------
+  # Linux / gcc / TLS（v0.91）：HTTPS / WSS 的门禁
+  #
+  # 为什么单独一个 job 而不是塞进上面的矩阵：
+  #   * 需要 libssl-dev（OpenSSL 由发行版提供，与 netmech「不代编 OpenSSL」的
+  #     约定一致，Windows 侧则由使用者自己装）；
+  #   * TLS 用例只在 -DNETMECH_TLS=ON 时才真正被编译进去，混进矩阵会让
+  #     "究竟是哪一半红了"变得含糊。
+  # ---------------------------------------------------------------------------
+  linux-tls:
+    name: Linux / gcc / TLS
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 检出 httpmech
+        uses: actions/checkout@v4
+        with:
+          path: httpmech
+
+      - name: 检出 netmech（依赖）
+        uses: actions/checkout@v4
+        with:
+          repository: goldhalo/netmech
+          path: netmech
+
+      - name: 安装工具（含 OpenSSL 开发包）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ libssl-dev
+
+      - name: 配置
+        working-directory: httpmech
+        run: |
+          cmake -S . -B build -G Ninja \
+                -DCMAKE_BUILD_TYPE=Debug \
+                -DNETMECH_TLS=ON \
+                -DHTTPMECH_WARNINGS_AS_ERRORS=ON
+
+      - name: 构建
+        working-directory: httpmech
+        run: cmake --build build --parallel
+
+      - name: 测试（HTTPS 用例必须**真的执行**）
+        working-directory: httpmech
+        run: |
+          set +e
+          ./build/bin/httpmech_ut 2>&1 | tee /tmp/ut.log
+          rc=${PIPESTATUS[0]}
+          if [ $rc -ne 0 ]; then
+            echo "::error title=TLS 单测失败::$(grep -m1 'FAIL' /tmp/ut.log | cut -c1-300)"
+            exit 1
+          fi
+          # 光"没失败"不够：若用例被 #if 掉，断言数会凭空少一截，
+          # 门禁看起来是绿的却什么也没守住。
+          grep -q '\[https e2e\]' /tmp/ut.log || {
+            echo "::error::https e2e 没有被执行（-DNETMECH_TLS=ON 没生效？）"
+            exit 1
+          }
+          echo "✅ https e2e 已执行"
+
+  # ---------------------------------------------------------------------------
   # Windows / MSVC
   #   e2e 用例是 POSIX socket，Windows 上会被 #if 掉；这里主要验证
   #   MSVC 能编过（/utf-8、/W4、模板实例化），以及纯逻辑单测能跑。
@@ -374,22 +435,52 @@ jobs:
           if [ $FAIL -eq 1 ]; then exit 1; fi
           echo "✅ 未发现 C++20 构造"
 
-      - name: 检查不得引入 Boost / OpenSSL
+      - name: 检查第三方头依赖边界（Boost / OpenSSL）
         run: |
-          # 只看 #include：注释里提到 boost::beast 是在讲"我们为什么不用它"，
-          # 不该算依赖（之前这条因为注释里的 boost:: 误报过一次）。
-          if grep -rnE '^[[:space:]]*#[[:space:]]*include[[:space:]]*<(boost|openssl)/' \
+          fail=0
+
+          # 1) 任何地方都不许引 Boost（本库零外部依赖；注释里提到 boost::beast
+          #    是在讲"我们为什么不用它"，只匹配 #include 行才不会误报）。
+          if grep -rnE '^[[:space:]]*#[[:space:]]*include[[:space:]]*<boost/' \
                include/ src/ example/ test/ --include='*.hpp' --include='*.cpp'; then
-            echo "❌ 发现有 boost / openssl 的 #include（本库零外部依赖）"
-            exit 1
+            echo "❌ 发现 boost 的 #include（本库零外部依赖）"
+            fail=1
           fi
+
+          # 2) 对外头文件：asio 与 openssl 一律不许出现。
+          #    装出去的包不带这些依赖，使用者不该被拖进来。
+          if grep -rnE '^[[:space:]]*#[[:space:]]*include[[:space:]]*<(asio|asio\.hpp|openssl)/' \
+               include/ --include='*.hpp'; then
+            echo "❌ 对外头文件引了 asio / openssl"
+            fail=1
+          fi
+
+          # 3) openssl 只允许出现在"运行时生成自签证书"的那一个测试文件里，
+          #    且必须在 NETMECH_HAS_TLS 保护下（否则 NETMECH_TLS=OFF 的构建编不过）。
+          for f in $(grep -rlE '^[[:space:]]*#[[:space:]]*include[[:space:]]*<openssl/' \
+                       src/ test/ example/ --include='*.hpp' --include='*.cpp' || true); do
+            case "$f" in
+              test/test_main.cpp) ;;
+              *) echo "❌ $f 不在 OpenSSL 允许清单内"; fail=1; continue ;;
+            esac
+            if ! grep -q 'NETMECH_HAS_TLS' "$f"; then
+              echo "❌ $f 引了 openssl 却没有 NETMECH_HAS_TLS 保护（OFF 构建会编不过）"
+              fail=1
+            fi
+          done
+
+          [ $fail -eq 0 ] || exit 1
+          echo "✅ 第三方依赖边界正常"
+
+      - name: 检查不得直接使用 asio
+        run: |
           # 顺带拦住 netmech 之外的第二份 asio（我们自己用的那份在 netmech 里）
           if grep -rnE '^[[:space:]]*#[[:space:]]*include[[:space:]]*<(asio|asio\.hpp)' \
                include/ src/ example/ --include='*.hpp' --include='*.cpp'; then
             echo "❌ 发现直接 #include asio（应通过 netmech 的头间接使用）"
             exit 1
           fi
-          echo "✅ 无 Boost / OpenSSL 依赖"
+          echo "✅ 无直接 asio 依赖"
 
       - name: 检查对外头文件不依赖 Asio
         run: |

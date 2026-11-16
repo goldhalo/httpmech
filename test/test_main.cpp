@@ -874,6 +874,23 @@ struct TestCert {
     TestCert() = default;
     TestCert(const TestCert&) = delete;
     TestCert& operator=(const TestCert&) = delete;
+
+    /// 移动构造：把临时文件的所有权转移过去（源对象清空，析构时不再删文件）。
+    ///
+    /// 不能省：`TestCert cert = make_self_signed();` 返回的是具名局部对象，
+    /// NRVO 不保证；没有移动构造时 GCC/Clang 会报 "use of deleted function"
+    /// （MSVC happen to 能过 —— 正是 CI 上 Linux 才会暴露的那类差异）。
+    TestCert(TestCert&& other) noexcept
+        : cert_path(std::move(other.cert_path))
+        , key_path(std::move(other.key_path))
+        , fingerprint(std::move(other.fingerprint))
+        , ok(other.ok)
+    {
+        other.cert_path.clear();
+        other.key_path.clear();
+        other.ok = false;
+    }
+
     ~TestCert()
     {
         if (!cert_path.empty()) std::remove(cert_path.c_str());
